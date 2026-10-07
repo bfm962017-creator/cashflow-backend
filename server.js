@@ -36,6 +36,20 @@ CREATE TABLE IF NOT EXISTS tx (
 );
 CREATE INDEX IF NOT EXISTS tx_user_idx ON tx (username);
 CREATE INDEX IF NOT EXISTS tx_date_idx ON tx (tx_date);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_at BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS activity (
+  id BIGSERIAL PRIMARY KEY,
+  ts BIGINT NOT NULL,
+  actor TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  action TEXT NOT NULL,
+  kind TEXT,
+  amount NUMERIC(14,2),
+  prev_amount NUMERIC(14,2),
+  notes TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS activity_ts_idx ON activity (ts DESC);
+CREATE INDEX IF NOT EXISTS activity_owner_idx ON activity (owner, ts DESC);
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
@@ -71,6 +85,19 @@ const rowTx = (r) => ({
   id: r.id, user: r.username, type: r.kind, amount: Number(r.amount),
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
 });
+const rowAct = (r) => ({
+  id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
+  amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
+});
+// Records who did what for the notification feed. A failed write never fails the request itself.
+// action: tx_add | tx_edit | tx_delete | user_add | user_delete | user_password
+async function logAct(actor, owner, action, tx, prev) {
+  try {
+    await pool.query(
+      'INSERT INTO activity (ts, actor, owner, action, kind, amount, prev_amount, notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [Date.now(), actor, owner, action, tx ? tx.kind : null, tx ? tx.amount : null, prev == null ? null : prev, tx ? (tx.notes || tx.descr || '') : '']);
+  } catch (e) { console.error('activity log failed:', e.message); }
+}
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 
 // simple login throttle: 8 failures / 15 min per ip+username
@@ -90,7 +117,7 @@ const auth = wrap(async (req, res, next) => {
   let p;
   try { p = jwt.verify(m[1], SECRET, { algorithms: ['HS256'] }); }
   catch { return res.status(401).json({ error: 'Session expired' }); }
-  const { rows } = await pool.query('SELECT username, role FROM users WHERE username = $1', [p.sub]);
+  const { rows } = await pool.query('SELECT username, role, seen_at FROM users WHERE username = $1', [p.sub]);
   if (!rows.length) return res.status(401).json({ error: 'Account no longer exists' });
   req.user = rows[0];
   next();
@@ -139,7 +166,19 @@ app.get('/api/data', auth, wrap(async (req, res) => {
   } else {
     users[req.user.username] = { name: req.user.username, role: req.user.role };
   }
-  res.json({ me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx) });
+  const a = admin
+    ? await pool.query('SELECT * FROM activity ORDER BY ts DESC LIMIT 50')
+    : await pool.query('SELECT * FROM activity WHERE owner = $1 ORDER BY ts DESC LIMIT 50', [req.user.username]);
+  res.json({
+    me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
+    activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
+  });
+}));
+
+app.post('/api/activity/seen', auth, wrap(async (req, res) => {
+  const now = Date.now();
+  await pool.query('UPDATE users SET seen_at = $2 WHERE username = $1', [req.user.username, now]);
+  res.json({ seenAt: now });
 }));
 
 function parseTx(b) {
@@ -166,27 +205,30 @@ app.post('/api/tx', auth, wrap(async (req, res) => {
   const { rows } = await pool.query(
     'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
     [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now()]);
+  await logAct(req.user.username, owner, 'tx_add', rows[0]);
   res.json(rowTx(rows[0]));
 }));
 
 app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   const p = parseTx(req.body);
   if (p.error) return res.status(400).json({ error: p.error });
-  const cur = await pool.query('SELECT username FROM tx WHERE id = $1', [req.params.id]);
+  const cur = await pool.query('SELECT username, amount FROM tx WHERE id = $1', [req.params.id]);
   if (!cur.rowCount || (req.user.role !== 'admin' && cur.rows[0].username !== req.user.username))
     return res.status(404).json({ error: 'Entry not found' });
   const v = p.v;
   const { rows } = await pool.query(
     'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7 WHERE id=$1 RETURNING *',
     [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc]);
+  await logAct(req.user.username, rows[0].username, 'tx_edit', rows[0], cur.rows[0].amount);
   res.json(rowTx(rows[0]));
 }));
 
 app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
   const r = req.user.role === 'admin'
-    ? await pool.query('DELETE FROM tx WHERE id = $1', [req.params.id])
-    : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2', [req.params.id, req.user.username]);
+    ? await pool.query('DELETE FROM tx WHERE id = $1 RETURNING *', [req.params.id])
+    : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
   if (!r.rowCount) return res.status(404).json({ error: 'Entry not found' });
+  await logAct(req.user.username, r.rows[0].username, 'tx_delete', r.rows[0]);
   res.json({ ok: true });
 }));
 
@@ -198,6 +240,7 @@ app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
   const r = await pool.query(
     "INSERT INTO users (username, role, pass_hash) VALUES ($1,'user',$2) ON CONFLICT DO NOTHING RETURNING username", [u, hash]);
   if (!r.rowCount) return res.status(409).json({ error: 'Username already exists' });
+  await logAct(req.user.username, u, 'user_add');
   res.json({ ok: true });
 }));
 
@@ -207,12 +250,14 @@ app.put('/api/users/:name/password', auth, adminOnly, wrap(async (req, res) => {
   const r = await pool.query('UPDATE users SET pass_hash = $2 WHERE username = $1',
     [uname(req.params.name), await bcrypt.hash(p, 10)]);
   if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
+  await logAct(req.user.username, uname(req.params.name), 'user_password');
   res.json({ ok: true });
 }));
 
 app.delete('/api/users/:name', auth, adminOnly, wrap(async (req, res) => {
   const r = await pool.query("DELETE FROM users WHERE username = $1 AND role <> 'admin'", [uname(req.params.name)]);
   if (!r.rowCount) return res.status(404).json({ error: 'User not found (admin cannot be deleted)' });
+  await logAct(req.user.username, uname(req.params.name), 'user_delete');
   res.json({ ok: true });
 }));
 
