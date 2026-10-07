@@ -1,0 +1,25 @@
+# Cashflow BACKEND (API only). Frontend is a separate static site.
+services:
+  - type: web
+    name: cashflow-api
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    autoDeploy: true
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: JWT_SECRET
+        generateValue: true
+      # Paste the Internal Database URL of your Render Postgres (cashflow-db)
+      - key: DATABASE_URL
+        sync: false
+      # Your frontend address, e.g. https://cashflow-web.onrender.com (no trailing slash)
+      - key: FRONTEND_URL
+        sync: false
