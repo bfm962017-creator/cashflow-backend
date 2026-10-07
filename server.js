@@ -107,7 +107,7 @@ const rowTx = (r) => ({
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
   party: r.party_id || null,
 });
-const rowParty = (r) => ({ id: r.id, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
+const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
@@ -196,7 +196,10 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
     biz: await bizInfo(false),
-    parties: (await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
+    // Users get only their own parties; the admin also gets everyone's, read-only (edits stay owner-only).
+    parties: (admin
+      ? await pool.query('SELECT * FROM parties ORDER BY owner, lower(name)')
+      : await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
   });
 }));
 
@@ -293,7 +296,7 @@ app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// Parties (customers, suppliers, staff): private to the user who added them.
+// Parties (customers, suppliers, staff): only the user who added a party can change it; the admin can view all.
 function parseParty(b) {
   const name = String(b.name || '').trim().slice(0, 80), phone = String(b.phone || '').replace(/[^\d+ ]/g, '').trim().slice(0, 20);
   const kind = ['customer', 'supplier', 'staff', 'other'].includes(b.kind) ? b.kind : 'customer';
