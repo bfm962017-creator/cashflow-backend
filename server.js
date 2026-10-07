@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS activity_ts_idx ON activity (ts DESC);
 CREATE INDEX IF NOT EXISTS activity_owner_idx ON activity (owner, ts DESC);
+CREATE TABLE IF NOT EXISTS settings (
+  id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  name TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL DEFAULT '',
+  logo TEXT,
+  updated BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO settings (id) VALUES (1) ON CONFLICT DO NOTHING;
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
@@ -69,7 +77,9 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-app.use(express.json({ limit: '50kb' }));
+// The business logo is sent as a data URL, so the settings route gets a bigger body limit.
+const jsonSmall = express.json({ limit: '50kb' }), jsonBig = express.json({ limit: '400kb' });
+app.use((req, res, next) => (req.path === '/api/settings' ? jsonBig : jsonSmall)(req, res, next));
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -90,7 +100,7 @@ const rowAct = (r) => ({
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: tx_add | tx_edit | tx_delete | user_add | user_delete | user_password
+// action: tx_add | tx_edit | tx_delete | user_add | user_delete | user_password | settings
 async function logAct(actor, owner, action, tx, prev) {
   try {
     await pool.query(
@@ -172,7 +182,35 @@ app.get('/api/data', auth, wrap(async (req, res) => {
   res.json({
     me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
+    biz: await bizInfo(false),
   });
+}));
+
+// Business settings (name, address, logo) are shared by everyone; only the admin can change them.
+// /api/data carries name/address and a version number; the logo is fetched here only when that changes.
+async function bizInfo(withLogo) {
+  const { rows } = await pool.query('SELECT name, address, logo, updated FROM settings WHERE id = 1');
+  const r = rows[0] || { name: '', address: '', logo: null, updated: 0 };
+  const out = { name: r.name, address: r.address, hasLogo: !!r.logo, v: Number(r.updated) };
+  if (withLogo) out.logo = r.logo || null;
+  return out;
+}
+
+app.get('/api/settings', auth, wrap(async (req, res) => res.json(await bizInfo(true))));
+
+app.put('/api/settings', auth, adminOnly, wrap(async (req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 80);
+  const address = String(req.body.address || '').trim().slice(0, 300);
+  const logo = req.body.logo;
+  if (logo != null && logo !== '' && !(typeof logo === 'string' && logo.length <= 400000 &&
+      /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(logo)))
+    return res.status(400).json({ error: 'Logo must be a PNG or JPEG image under 300 KB' });
+  if (logo === undefined)
+    await pool.query('UPDATE settings SET name = $1, address = $2, updated = $3 WHERE id = 1', [name, address, Date.now()]);
+  else
+    await pool.query('UPDATE settings SET name = $1, address = $2, logo = $3, updated = $4 WHERE id = 1', [name, address, logo || null, Date.now()]);
+  await logAct(req.user.username, req.user.username, 'settings');
+  res.json(await bizInfo(true));
 }));
 
 app.post('/api/activity/seen', auth, wrap(async (req, res) => {
@@ -265,6 +303,7 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.get('/', (req, res) => res.json({ name: 'cashflow-api', ok: true }));
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Bad request' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'That is too large to upload' });
   console.error(err);
   res.status(500).json({ error: 'Server error' });
 });
