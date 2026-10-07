@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS settings (
   updated BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS parties (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  name TEXT NOT NULL,
+  phone TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'customer' CHECK (kind IN ('customer','supplier','staff','other')),
+  ts BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
+ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
+CREATE INDEX IF NOT EXISTS tx_party_idx ON tx (party_id);
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
@@ -94,7 +105,9 @@ const sign = (u) => jwt.sign({ sub: u }, SECRET, { expiresIn: '7d', algorithm: '
 const rowTx = (r) => ({
   id: r.id, user: r.username, type: r.kind, amount: Number(r.amount),
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
+  party: r.party_id || null,
 });
+const rowParty = (r) => ({ id: r.id, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
@@ -183,6 +196,7 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
     biz: await bizInfo(false),
+    parties: (await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
   });
 }));
 
@@ -227,7 +241,14 @@ function parseTx(b) {
   if (!(amount > 0 && amount < 1e11)) return { error: 'Enter a valid amount' };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) return { error: 'Invalid date' };
   if (time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return { error: 'Invalid time' };
-  return { v: { type, amount, date, time, notes, desc } };
+  const party = b.party ? String(b.party) : null;
+  return { v: { type, amount, date, time, notes, desc, party } };
+}
+// A party can only be attached to entries in the cashbook of the user who added that party.
+async function partyOk(party, owner) {
+  if (!party) return true;
+  const r = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [party, owner]);
+  return r.rowCount > 0;
 }
 
 app.post('/api/tx', auth, wrap(async (req, res) => {
@@ -240,9 +261,10 @@ app.post('/api/tx', auth, wrap(async (req, res) => {
     if (!e.rowCount) return res.status(400).json({ error: 'Unknown user' });
   }
   const v = p.v, id = crypto.randomUUID();
+  if (!(await partyOk(v.party, owner))) return res.status(400).json({ error: 'Unknown party' });
   const { rows } = await pool.query(
-    'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-    [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now()]);
+    'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+    [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now(), v.party]);
   await logAct(req.user.username, owner, 'tx_add', rows[0]);
   res.json(rowTx(rows[0]));
 }));
@@ -254,9 +276,10 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   if (!cur.rowCount || (req.user.role !== 'admin' && cur.rows[0].username !== req.user.username))
     return res.status(404).json({ error: 'Entry not found' });
   const v = p.v;
+  if (!(await partyOk(v.party, cur.rows[0].username))) return res.status(400).json({ error: 'Unknown party' });
   const { rows } = await pool.query(
-    'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7 WHERE id=$1 RETURNING *',
-    [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc]);
+    'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7, party_id=$8 WHERE id=$1 RETURNING *',
+    [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc, v.party]);
   await logAct(req.user.username, rows[0].username, 'tx_edit', rows[0], cur.rows[0].amount);
   res.json(rowTx(rows[0]));
 }));
@@ -267,6 +290,41 @@ app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
     : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
   if (!r.rowCount) return res.status(404).json({ error: 'Entry not found' });
   await logAct(req.user.username, r.rows[0].username, 'tx_delete', r.rows[0]);
+  res.json({ ok: true });
+}));
+
+// Parties (customers, suppliers, staff): private to the user who added them.
+function parseParty(b) {
+  const name = String(b.name || '').trim().slice(0, 80), phone = String(b.phone || '').replace(/[^\d+ ]/g, '').trim().slice(0, 20);
+  const kind = ['customer', 'supplier', 'staff', 'other'].includes(b.kind) ? b.kind : 'customer';
+  if (!name) return { error: 'Enter a name' };
+  return { v: { name, phone, kind } };
+}
+app.post('/api/parties', auth, wrap(async (req, res) => {
+  const p = parseParty(req.body);
+  if (p.error) return res.status(400).json({ error: p.error });
+  const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2)', [req.user.username, p.v.name]);
+  if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
+  const { rows } = await pool.query('INSERT INTO parties (id, owner, name, phone, kind, ts) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+    [crypto.randomUUID(), req.user.username, p.v.name, p.v.phone, p.v.kind, Date.now()]);
+  res.json(rowParty(rows[0]));
+}));
+app.put('/api/parties/:id', auth, wrap(async (req, res) => {
+  const p = parseParty(req.body);
+  if (p.error) return res.status(400).json({ error: p.error });
+  const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2) AND id <> $3', [req.user.username, p.v.name, req.params.id]);
+  if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
+  const { rows } = await pool.query('UPDATE parties SET name = $3, phone = $4, kind = $5 WHERE id = $1 AND owner = $2 RETURNING *',
+    [req.params.id, req.user.username, p.v.name, p.v.phone, p.v.kind]);
+  if (!rows.length) return res.status(404).json({ error: 'Party not found' });
+  res.json(rowParty(rows[0]));
+}));
+app.delete('/api/parties/:id', auth, wrap(async (req, res) => {
+  const mine = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [req.params.id, req.user.username]);
+  if (!mine.rowCount) return res.status(404).json({ error: 'Party not found' });
+  const used = await pool.query('SELECT 1 FROM tx WHERE party_id = $1 LIMIT 1', [req.params.id]);
+  if (used.rowCount) return res.status(409).json({ error: 'This party has entries. Delete those entries first.' });
+  await pool.query('DELETE FROM parties WHERE id = $1 AND owner = $2', [req.params.id, req.user.username]);
   res.json({ ok: true });
 }));
 
