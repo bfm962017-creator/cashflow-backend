@@ -387,19 +387,21 @@ app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
 }));
 
 // Deleted entries (admin): deletions from the last 30 days that have not been restored.
-app.get('/api/deleted', auth, adminOnly, wrap(async (req, res) => {
-  const since = Date.now() - 30 * 86400000;
+// Deleted entries (last 30 days): the admin sees all; a user sees only their own cashbook's.
+app.get('/api/deleted', auth, wrap(async (req, res) => {
+  const since = Date.now() - 30 * 86400000, admin = req.user.role === 'admin';
   const { rows } = await pool.query(
     `SELECT DISTINCT ON (h.tx_id) h.* FROM tx_history h
      WHERE h.action = 'delete' AND h.ts > $1 AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = h.tx_id)
-     ORDER BY h.tx_id, h.ts DESC`, [since]);
+     ${admin ? '' : 'AND h.owner = $2'}
+     ORDER BY h.tx_id, h.ts DESC`, admin ? [since] : [since, req.user.username]);
   rows.sort((a, b) => Number(b.ts) - Number(a.ts));
   res.json(rows.map((h) => ({ id: Number(h.id), ts: Number(h.ts), actor: h.actor, snapshot: h.snapshot })));
 }));
 
-app.post('/api/deleted/:id/restore', auth, adminOnly, wrap(async (req, res) => {
+app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM tx_history WHERE id = $1 AND action = 'delete'", [req.params.id]);
-  if (!rows.length) return res.status(404).json({ error: 'Not found' });
+  if (!rows.length || (req.user.role !== 'admin' && rows[0].owner !== req.user.username)) return res.status(404).json({ error: 'Not found' });
   const s = rows[0].snapshot;
   const exists = await pool.query('SELECT 1 FROM tx WHERE id = $1', [s.id]);
   if (exists.rowCount) return res.status(409).json({ error: 'This entry is already back' });
