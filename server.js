@@ -228,6 +228,9 @@ const auth = wrap(async (req, res, next) => {
 });
 const adminOnly = (req, res, next) =>
   req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admin only' });
+const noAdmin = (msg) => (req, res, next) =>
+  req.user.role === 'user' ? next() : res.status(403).json({ error: msg });
+const TRANSFER_USERS = 'Transfers are only between users';
 
 app.get('/health', (req, res) => res.type('text').send('ok'));
 
@@ -373,15 +376,12 @@ async function partyOk(party, owner) {
   return r.rowCount > 0;
 }
 
-app.post('/api/tx', auth, wrap(async (req, res) => {
+// Only users add entries, always into their own cashbook. The admin supervises: it can read,
+// correct and delete everyone's entries, but does not add any.
+app.post('/api/tx', auth, noAdmin('The admin does not add entries'), wrap(async (req, res) => {
   const p = parseTx(req.body);
   if (p.error) return res.status(400).json({ error: p.error });
-  let owner = req.user.username;
-  if (req.user.role === 'admin' && req.body.user) {
-    owner = uname(req.body.user);
-    const e = await pool.query('SELECT 1 FROM users WHERE username = $1', [owner]);
-    if (!e.rowCount) return res.status(400).json({ error: 'Unknown user' });
-  }
+  const owner = req.user.username;
   const v = p.v, id = crypto.randomUUID(), c = await lockCutoff(req);
   if (c && v.date < c) return locked(res, c);
   if (!(await partyOk(v.party, owner))) return res.status(400).json({ error: 'Unknown party' });
@@ -574,9 +574,7 @@ app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
 
 // Transfers between users (not the admin). Nothing is added to either cashbook until the receiver
 // accepts; then the sender gets a Cash Out and the receiver a Cash In, linked by transfer_id.
-const noAdmin = (req, res, next) =>
-  req.user.role === 'user' ? next() : res.status(403).json({ error: 'Transfers are only between users' });
-app.post('/api/transfers', auth, noAdmin, wrap(async (req, res) => {
+app.post('/api/transfers', auth, noAdmin(TRANSFER_USERS), wrap(async (req, res) => {
   const to = uname(req.body.to), amount = Math.round(Number(req.body.amount) * 100) / 100, date = String(req.body.date || '');
   const notes = String(req.body.notes || '').trim().slice(0, 200);
   if (!to || to === req.user.username) return res.status(400).json({ error: 'Choose who to send to' });
@@ -609,7 +607,7 @@ async function decide(req, res, who, status, fn) {
     res.json(rowTr(u.rows[0]));
   } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
 }
-app.post('/api/transfers/:id/accept', auth, noAdmin, wrap(async (req, res) => {
+app.post('/api/transfers/:id/accept', auth, noAdmin(TRANSFER_USERS), wrap(async (req, res) => {
   const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(req.body.time || '') ? req.body.time : '';
   await decide(req, res, 'to_user', 'accepted', async (c, t) => {
     const ins = (user, kind, notes) => c.query(
@@ -618,8 +616,8 @@ app.post('/api/transfers/:id/accept', auth, noAdmin, wrap(async (req, res) => {
     return [(await ins(t.from_user, 'out', '⇄ To ' + t.to_user)).rows[0], (await ins(t.to_user, 'in', '⇄ From ' + t.from_user)).rows[0]];
   });
 }));
-app.post('/api/transfers/:id/reject', auth, noAdmin, wrap((req, res) => decide(req, res, 'to_user', 'rejected')));
-app.post('/api/transfers/:id/cancel', auth, noAdmin, wrap((req, res) => decide(req, res, 'from_user', 'cancelled')));
+app.post('/api/transfers/:id/reject', auth, noAdmin(TRANSFER_USERS), wrap((req, res) => decide(req, res, 'to_user', 'rejected')));
+app.post('/api/transfers/:id/cancel', auth, noAdmin(TRANSFER_USERS), wrap((req, res) => decide(req, res, 'from_user', 'cancelled')));
 
 // Changing or deleting an accepted transfer: one user asks, the other agrees or refuses.
 // Until then both cashbooks stay as they are. The admin can still change transfers directly.
@@ -635,7 +633,7 @@ async function onTransfer(req, res, fn) {
   for (const g of r.acts || []) await logAct(req.user.username, g.owner, g.action, g.row, g.prev);
   res.json(rowTr(r.t));
 }
-app.post('/api/transfers/:id/request', auth, noAdmin, wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
+app.post('/api/transfers/:id/request', auth, noAdmin(TRANSFER_USERS), wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
   const kind = req.body.kind;
   if (t.status !== 'accepted') return { code: 409, error: 'Only an accepted transfer can be changed' };
   if (t.req_kind) return { code: 409, error: 'A request for this transfer is already waiting' };
@@ -652,7 +650,7 @@ app.post('/api/transfers/:id/request', auth, noAdmin, wrap((req, res) => onTrans
     [t.id, kind, req.user.username, amount, notes, Date.now()]);
   return { t: u.rows[0], act: { owner: other, action: 'tr_req', row: { kind, amount: kind === 'edit' ? amount : t.amount, notes: t.notes }, prev: kind === 'edit' ? t.amount : null } };
 })));
-app.post('/api/transfers/:id/request/:answer', auth, noAdmin, wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
+app.post('/api/transfers/:id/request/:answer', auth, noAdmin(TRANSFER_USERS), wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
   const a = req.params.answer;
   if (!t.req_kind) return { code: 409, error: 'There is no request waiting' };
   if (!['agree', 'refuse', 'withdraw'].includes(a)) return { code: 404, error: 'Not found' };
@@ -675,7 +673,7 @@ function parseParty(b) {
   if (!name) return { error: 'Enter a name' };
   return { v: { name, phone, kind, due } };
 }
-app.post('/api/parties', auth, wrap(async (req, res) => {
+app.post('/api/parties', auth, noAdmin('The admin does not add parties'), wrap(async (req, res) => {
   const p = parseParty(req.body);
   if (p.error) return res.status(400).json({ error: p.error });
   const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2)', [req.user.username, p.v.name]);
