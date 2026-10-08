@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS tx_history (
 );
 CREATE INDEX IF NOT EXISTS tx_history_tx_idx ON tx_history (tx_id, ts);
 CREATE INDEX IF NOT EXISTS tx_history_del_idx ON tx_history (action, ts DESC);
+CREATE TABLE IF NOT EXISTS tx_photos (
+  tx_id TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  bytes INT NOT NULL,
+  ts BIGINT NOT NULL
+);
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
@@ -102,7 +108,7 @@ app.use((req, res, next) => {
 });
 // The business logo is sent as a data URL, so the settings route gets a bigger body limit.
 const jsonSmall = express.json({ limit: '50kb' }), jsonBig = express.json({ limit: '400kb' });
-app.use((req, res, next) => (req.path === '/api/settings' ? jsonBig : jsonSmall)(req, res, next));
+app.use((req, res, next) => (req.path === '/api/settings' || /^\/api\/tx\/[^/]+\/photo$/.test(req.path) ? jsonBig : jsonSmall)(req, res, next));
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -117,7 +123,7 @@ const sign = (u) => jwt.sign({ sub: u }, SECRET, { expiresIn: '7d', algorithm: '
 const rowTx = (r) => ({
   id: r.id, user: r.username, type: r.kind, amount: Number(r.amount),
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
-  party: r.party_id || null, edited: !!r.edited,
+  party: r.party_id || null, edited: !!r.edited, photo: !!r.has_photo,
 });
 const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
 const rowAct = (r) => ({
@@ -207,7 +213,8 @@ app.post('/api/login', wrap(async (req, res) => {
   res.json({ token: sign(u) });
 }));
 
-const TX_SELECT = "SELECT tx.*, EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = tx.id AND h.action = 'edit') AS edited FROM tx";
+const TX_SELECT = "SELECT tx.*, EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = tx.id AND h.action = 'edit') AS edited, " +
+  "EXISTS (SELECT 1 FROM tx_photos ph WHERE ph.tx_id = tx.id) AS has_photo FROM tx";
 app.get('/api/data', auth, wrap(async (req, res) => {
   const admin = req.user.role === 'admin';
   const t = admin
@@ -228,6 +235,7 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
     biz: await bizInfo(false),
     // Users get only their own parties; the admin also gets everyone's, read-only (edits stay owner-only).
+    photoBytes: admin ? Number((await pool.query('SELECT COALESCE(SUM(bytes),0) AS b FROM tx_photos')).rows[0].b) : undefined,
     parties: (admin
       ? await pool.query('SELECT * FROM parties ORDER BY owner, lower(name)')
       : await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
@@ -339,6 +347,44 @@ app.get('/api/tx/:id/history', auth, wrap(async (req, res) => {
   res.json(rows.map((h) => ({ id: Number(h.id), ts: Number(h.ts), actor: h.actor, action: h.action, changes: h.changes, snapshot: h.snapshot })));
 }));
 
+// Bill photos: one compressed JPEG per entry, stored apart from the entry so lists stay light.
+// Only the entry's owner and the admin can read or change it. Photos of deleted entries are kept
+// while the entry can still be restored (30 days) and cleaned up on startup after that.
+async function txOwnerOk(req, id) {
+  const r = await pool.query('SELECT username, ts FROM tx WHERE id = $1', [id]);
+  return r.rows.length && (req.user.role === 'admin' || r.rows[0].username === req.user.username) ? r.rows[0] : null;
+}
+app.get('/api/tx/:id/photo', auth, wrap(async (req, res) => {
+  if (!(await txOwnerOk(req, req.params.id))) return res.status(404).json({ error: 'Entry not found' });
+  const { rows } = await pool.query('SELECT data FROM tx_photos WHERE tx_id = $1', [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: 'No photo' });
+  res.set('Cache-Control', 'private, max-age=86400').json({ photo: rows[0].data });
+}));
+app.put('/api/tx/:id/photo', auth, wrap(async (req, res) => {
+  const tx = await txOwnerOk(req, req.params.id);
+  if (!tx) return res.status(404).json({ error: 'Entry not found' });
+  const photo = req.body.photo;
+  if (!(typeof photo === 'string' && photo.length <= 400000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(photo)))
+    return res.status(400).json({ error: 'Photo must be a JPEG under 300 KB' });
+  const had = (await pool.query('SELECT 1 FROM tx_photos WHERE tx_id = $1', [req.params.id])).rowCount > 0;
+  const bytes = Math.round((photo.length - 23) * 3 / 4);
+  await pool.query('INSERT INTO tx_photos (tx_id, data, bytes, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (tx_id) DO UPDATE SET data = $2, bytes = $3, ts = $4',
+    [req.params.id, photo, bytes, Date.now()]);
+  // A photo attached while the entry is being created is part of adding it, not an edit.
+  if (had || Date.now() - Number(tx.ts) > 120000)
+    await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
+      [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: [had ? 'yes' : null, had ? 'replaced' : 'added'] }]);
+  res.json({ ok: true, bytes });
+}));
+app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
+  const tx = await txOwnerOk(req, req.params.id);
+  if (!tx) return res.status(404).json({ error: 'Entry not found' });
+  const r = await pool.query('DELETE FROM tx_photos WHERE tx_id = $1', [req.params.id]);
+  if (r.rowCount) await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
+    [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: ['yes', null] }]);
+  res.json({ ok: true });
+}));
+
 // Deleted entries (admin): deletions from the last 30 days that have not been restored.
 app.get('/api/deleted', auth, adminOnly, wrap(async (req, res) => {
   const since = Date.now() - 30 * 86400000;
@@ -447,5 +493,9 @@ app.use((err, req, res, next) => {
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
+  // Drop photos of entries deleted more than 30 days ago (they can no longer be restored).
+  pool.query(`DELETE FROM tx_photos p WHERE NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = p.tx_id)
+    AND NOT EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = p.tx_id AND h.action = 'delete' AND h.ts > $1)`, [Date.now() - 30 * 86400000])
+    .catch((e) => console.error('photo cleanup failed:', e.message));
   app.listen(PORT, '0.0.0.0', () => console.log('Cashflow listening on ' + PORT));
 })();
