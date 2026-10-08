@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS parties (
 CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
 CREATE INDEX IF NOT EXISTS tx_party_idx ON tx (party_id);
+CREATE TABLE IF NOT EXISTS tx_history (
+  id BIGSERIAL PRIMARY KEY,
+  tx_id TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  ts BIGINT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('add','edit','delete','restore')),
+  changes JSONB,
+  snapshot JSONB
+);
+CREATE INDEX IF NOT EXISTS tx_history_tx_idx ON tx_history (tx_id, ts);
+CREATE INDEX IF NOT EXISTS tx_history_del_idx ON tx_history (action, ts DESC);
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
@@ -105,7 +117,7 @@ const sign = (u) => jwt.sign({ sub: u }, SECRET, { expiresIn: '7d', algorithm: '
 const rowTx = (r) => ({
   id: r.id, user: r.username, type: r.kind, amount: Number(r.amount),
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
-  party: r.party_id || null,
+  party: r.party_id || null, edited: !!r.edited,
 });
 const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
 const rowAct = (r) => ({
@@ -113,7 +125,25 @@ const rowAct = (r) => ({
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: tx_add | tx_edit | tx_delete | user_add | user_delete | user_password | settings
+// action: tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings
+// Entry history: every add / edit / delete / restore is stored with who, when and what changed.
+// Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
+const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
+const snap = (r) => ({ id: r.id, username: r.username, kind: r.kind, amount: Number(r.amount), tx_date: r.tx_date, tx_time: r.tx_time,
+  notes: r.notes, descr: r.descr, ts: Number(r.ts), party_id: r.party_id || null });
+async function logHist(txRow, actor, action, before) {
+  try {
+    let changes = null;
+    if (action === 'edit') {
+      const a = snap(before), b = snap(txRow);
+      changes = {};
+      HIST_FIELDS.forEach((f) => { if (String(a[f] ?? '') !== String(b[f] ?? '')) changes[f] = [a[f], b[f]]; });
+      if (!Object.keys(changes).length) return;
+    }
+    await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes, snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [txRow.id, txRow.username, Date.now(), actor, action, changes, action === 'edit' ? null : snap(txRow)]);
+  } catch (e) { console.error('history log failed:', e.message); }
+}
 async function logAct(actor, owner, action, tx, prev) {
   try {
     await pool.query(
@@ -177,11 +207,12 @@ app.post('/api/login', wrap(async (req, res) => {
   res.json({ token: sign(u) });
 }));
 
+const TX_SELECT = "SELECT tx.*, EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = tx.id AND h.action = 'edit') AS edited FROM tx";
 app.get('/api/data', auth, wrap(async (req, res) => {
   const admin = req.user.role === 'admin';
   const t = admin
-    ? await pool.query('SELECT * FROM tx ORDER BY tx_date, tx_time, ts')
-    : await pool.query('SELECT * FROM tx WHERE username = $1 ORDER BY tx_date, tx_time, ts', [req.user.username]);
+    ? await pool.query(TX_SELECT + ' ORDER BY tx_date, tx_time, ts')
+    : await pool.query(TX_SELECT + ' WHERE username = $1 ORDER BY tx_date, tx_time, ts', [req.user.username]);
   const users = {};
   if (admin) {
     (await pool.query('SELECT username, role FROM users ORDER BY username')).rows
@@ -269,13 +300,14 @@ app.post('/api/tx', auth, wrap(async (req, res) => {
     'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
     [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now(), v.party]);
   await logAct(req.user.username, owner, 'tx_add', rows[0]);
+  await logHist(rows[0], req.user.username, 'add');
   res.json(rowTx(rows[0]));
 }));
 
 app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   const p = parseTx(req.body);
   if (p.error) return res.status(400).json({ error: p.error });
-  const cur = await pool.query('SELECT username, amount FROM tx WHERE id = $1', [req.params.id]);
+  const cur = await pool.query('SELECT * FROM tx WHERE id = $1', [req.params.id]);
   if (!cur.rowCount || (req.user.role !== 'admin' && cur.rows[0].username !== req.user.username))
     return res.status(404).json({ error: 'Entry not found' });
   const v = p.v;
@@ -284,7 +316,8 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
     'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7, party_id=$8 WHERE id=$1 RETURNING *',
     [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc, v.party]);
   await logAct(req.user.username, rows[0].username, 'tx_edit', rows[0], cur.rows[0].amount);
-  res.json(rowTx(rows[0]));
+  await logHist(rows[0], req.user.username, 'edit', cur.rows[0]);
+  res.json(rowTx({ ...rows[0], edited: true }));
 }));
 
 app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
@@ -293,7 +326,43 @@ app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
     : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
   if (!r.rowCount) return res.status(404).json({ error: 'Entry not found' });
   await logAct(req.user.username, r.rows[0].username, 'tx_delete', r.rows[0]);
+  await logHist(r.rows[0], req.user.username, 'delete');
   res.json({ ok: true });
+}));
+
+// History of one entry: its owner and the admin can read it. Works for deleted entries too.
+app.get('/api/tx/:id/history', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM tx_history WHERE tx_id = $1 ORDER BY ts DESC, id DESC', [req.params.id]);
+  const cur = await pool.query('SELECT username FROM tx WHERE id = $1', [req.params.id]);
+  const owner = cur.rows.length ? cur.rows[0].username : rows.length ? rows[0].owner : null;
+  if (!owner || (req.user.role !== 'admin' && owner !== req.user.username)) return res.status(404).json({ error: 'Entry not found' });
+  res.json(rows.map((h) => ({ id: Number(h.id), ts: Number(h.ts), actor: h.actor, action: h.action, changes: h.changes, snapshot: h.snapshot })));
+}));
+
+// Deleted entries (admin): deletions from the last 30 days that have not been restored.
+app.get('/api/deleted', auth, adminOnly, wrap(async (req, res) => {
+  const since = Date.now() - 30 * 86400000;
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (h.tx_id) h.* FROM tx_history h
+     WHERE h.action = 'delete' AND h.ts > $1 AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = h.tx_id)
+     ORDER BY h.tx_id, h.ts DESC`, [since]);
+  rows.sort((a, b) => Number(b.ts) - Number(a.ts));
+  res.json(rows.map((h) => ({ id: Number(h.id), ts: Number(h.ts), actor: h.actor, snapshot: h.snapshot })));
+}));
+
+app.post('/api/deleted/:id/restore', auth, adminOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM tx_history WHERE id = $1 AND action = 'delete'", [req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: 'Not found' });
+  const s = rows[0].snapshot;
+  const exists = await pool.query('SELECT 1 FROM tx WHERE id = $1', [s.id]);
+  if (exists.rowCount) return res.status(409).json({ error: 'This entry is already back' });
+  const pty = s.party_id ? (await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [s.party_id, s.username])).rowCount ? s.party_id : null : null;
+  const r = await pool.query(
+    'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+    [s.id, s.username, s.kind, s.amount, s.tx_date, s.tx_time, s.notes, s.descr, s.ts, pty]);
+  await logHist(r.rows[0], req.user.username, 'restore');
+  await logAct(req.user.username, s.username, 'tx_restore', r.rows[0]);
+  res.json(rowTx(r.rows[0]));
 }));
 
 // Parties (customers, suppliers, staff): only the user who added a party can change it; the admin can view all.
