@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS settings (
   updated BIGINT NOT NULL DEFAULT 0
 );
 INSERT INTO settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS lock_days INT NOT NULL DEFAULT -1;
 CREATE TABLE IF NOT EXISTS parties (
   id TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -148,7 +149,7 @@ const rowAct = (r) => ({
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
+// action: lock | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
 // Entry history: every add / edit / delete / restore is stored with who, when and what changed.
 // Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
 const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
@@ -268,9 +269,9 @@ app.get('/api/data', auth, wrap(async (req, res) => {
 // Business settings (name, address, logo) are shared by everyone; only the admin can change them.
 // /api/data carries name/address and a version number; the logo is fetched here only when that changes.
 async function bizInfo(withLogo) {
-  const { rows } = await pool.query('SELECT name, address, logo, updated FROM settings WHERE id = 1');
-  const r = rows[0] || { name: '', address: '', logo: null, updated: 0 };
-  const out = { name: r.name, address: r.address, hasLogo: !!r.logo, v: Number(r.updated) };
+  const { rows } = await pool.query('SELECT name, address, logo, updated, lock_days FROM settings WHERE id = 1');
+  const r = rows[0] || { name: '', address: '', logo: null, updated: 0, lock_days: -1 };
+  const out = { name: r.name, address: r.address, hasLogo: !!r.logo, v: Number(r.updated), lock: Number(r.lock_days) };
   if (withLogo) out.logo = r.logo || null;
   return out;
 }
@@ -296,6 +297,27 @@ app.post('/api/activity/seen', auth, wrap(async (req, res) => {
   const now = Date.now();
   await pool.query('UPDATE users SET seen_at = $2 WHERE username = $1', [req.user.username, now]);
   res.json({ seenAt: now });
+}));
+
+// Lock old entries: when on, users (never the admin) cannot add, change or delete entries dated
+// before the cut-off. lock_days: -1 = off, 0 = only today's entries, N = today and the N days before.
+// Dates are counted in India time, which is what the app's users see.
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const istToday = () => new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+function cutoffFor(days) { const t = new Date(istToday() + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() - days); return t.toISOString().slice(0, 10); }
+async function lockCutoff(req) {
+  if (req.user.role === 'admin') return null;
+  const d = Number((await pool.query('SELECT lock_days FROM settings WHERE id = 1')).rows[0]?.lock_days ?? -1);
+  return d < 0 ? null : cutoffFor(d);
+}
+const locked = (res, c) => res.status(403).json({ error: 'Locked: entries before ' + +c.slice(8) + ' ' + MON[+c.slice(5, 7) - 1] + ' ' + c.slice(0, 4) + ' can only be changed by the admin' });
+
+app.put('/api/lock', auth, adminOnly, wrap(async (req, res) => {
+  const d = Math.round(Number(req.body.days));
+  if (!(d >= -1 && d <= 365)) return res.status(400).json({ error: 'Invalid number of days' });
+  await pool.query('UPDATE settings SET lock_days = $1 WHERE id = 1', [d]);
+  await logAct(req.user.username, req.user.username, 'lock', { kind: null, amount: d, notes: '' });
+  res.json({ lock: d });
 }));
 
 function parseTx(b) {
@@ -325,7 +347,8 @@ app.post('/api/tx', auth, wrap(async (req, res) => {
     const e = await pool.query('SELECT 1 FROM users WHERE username = $1', [owner]);
     if (!e.rowCount) return res.status(400).json({ error: 'Unknown user' });
   }
-  const v = p.v, id = crypto.randomUUID();
+  const v = p.v, id = crypto.randomUUID(), c = await lockCutoff(req);
+  if (c && v.date < c) return locked(res, c);
   if (!(await partyOk(v.party, owner))) return res.status(400).json({ error: 'Unknown party' });
   const { rows } = await pool.query(
     'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
@@ -341,7 +364,8 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   const cur = await pool.query('SELECT * FROM tx WHERE id = $1', [req.params.id]);
   if (!cur.rowCount || (req.user.role !== 'admin' && cur.rows[0].username !== req.user.username))
     return res.status(404).json({ error: 'Entry not found' });
-  const v = p.v;
+  const v = p.v, c = await lockCutoff(req);
+  if (c && (cur.rows[0].tx_date < c || v.date < c)) return locked(res, c);
   if (cur.rows[0].transfer_id) return editTransferTx(req, res, cur.rows[0], v);
   if (!(await partyOk(v.party, cur.rows[0].username))) return res.status(400).json({ error: 'Unknown party' });
   const { rows } = await pool.query(
@@ -368,6 +392,11 @@ async function editTransferTx(req, res, cur, v) {
 }
 
 app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
+  const c = await lockCutoff(req);
+  if (c) {
+    const o = await pool.query('SELECT tx_date FROM tx WHERE id = $1 AND username = $2', [req.params.id, req.user.username]);
+    if (o.rowCount && o.rows[0].tx_date < c) return locked(res, c);
+  }
   const r = req.user.role === 'admin'
     ? await pool.query('DELETE FROM tx WHERE id = $1 RETURNING *', [req.params.id])
     : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
@@ -398,7 +427,7 @@ app.get('/api/tx/:id/history', auth, wrap(async (req, res) => {
 // Only the entry's owner and the admin can read or change it. Photos of deleted entries are kept
 // while the entry can still be restored (30 days) and cleaned up on startup after that.
 async function txOwnerOk(req, id) {
-  const r = await pool.query('SELECT username, ts FROM tx WHERE id = $1', [id]);
+  const r = await pool.query('SELECT username, ts, tx_date FROM tx WHERE id = $1', [id]);
   return r.rows.length && (req.user.role === 'admin' || r.rows[0].username === req.user.username) ? r.rows[0] : null;
 }
 app.get('/api/tx/:id/photo', auth, wrap(async (req, res) => {
@@ -410,6 +439,8 @@ app.get('/api/tx/:id/photo', auth, wrap(async (req, res) => {
 app.put('/api/tx/:id/photo', auth, wrap(async (req, res) => {
   const tx = await txOwnerOk(req, req.params.id);
   if (!tx) return res.status(404).json({ error: 'Entry not found' });
+  const c = await lockCutoff(req);
+  if (c && tx.tx_date < c) return locked(res, c);
   const photo = req.body.photo;
   if (!(typeof photo === 'string' && photo.length <= 400000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(photo)))
     return res.status(400).json({ error: 'Photo must be a JPEG under 300 KB' });
@@ -426,6 +457,8 @@ app.put('/api/tx/:id/photo', auth, wrap(async (req, res) => {
 app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
   const tx = await txOwnerOk(req, req.params.id);
   if (!tx) return res.status(404).json({ error: 'Entry not found' });
+  const c = await lockCutoff(req);
+  if (c && tx.tx_date < c) return locked(res, c);
   const r = await pool.query('DELETE FROM tx_photos WHERE tx_id = $1', [req.params.id]);
   if (r.rowCount) await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
     [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: ['yes', null] }]);
@@ -448,7 +481,8 @@ app.get('/api/deleted', auth, wrap(async (req, res) => {
 app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM tx_history WHERE id = $1 AND action = 'delete'", [req.params.id]);
   if (!rows.length || (req.user.role !== 'admin' && rows[0].owner !== req.user.username)) return res.status(404).json({ error: 'Not found' });
-  const s = rows[0].snapshot;
+  const s = rows[0].snapshot, c = await lockCutoff(req);
+  if (c && s.tx_date < c) return locked(res, c);
   const exists = await pool.query('SELECT 1 FROM tx WHERE id = $1', [s.id]);
   if (exists.rowCount) return res.status(409).json({ error: 'This entry is already back' });
   const pty = s.party_id ? (await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [s.party_id, s.username])).rowCount ? s.party_id : null : null;
@@ -485,6 +519,8 @@ app.post('/api/transfers', auth, noAdmin, wrap(async (req, res) => {
   if (!u.rowCount || u.rows[0].role !== 'user') return res.status(400).json({ error: 'Choose who to send to' });
   if (!(amount > 0 && amount < 1e11)) return res.status(400).json({ error: 'Enter a valid amount' });
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) return res.status(400).json({ error: 'Invalid date' });
+  const c = await lockCutoff(req);
+  if (c && date < c) return locked(res, c);
   const { rows } = await pool.query('INSERT INTO transfers (id, from_user, to_user, amount, tx_date, notes, ts) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
     [crypto.randomUUID(), req.user.username, to, amount, date, notes, Date.now()]);
   await logAct(req.user.username, to, 'tr_send', { kind: 'in', amount, notes });
