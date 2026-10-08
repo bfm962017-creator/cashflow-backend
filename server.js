@@ -69,6 +69,20 @@ CREATE TABLE IF NOT EXISTS parties (
 CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
 ALTER TABLE parties ADD COLUMN IF NOT EXISTS due TEXT NOT NULL DEFAULT '';
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
+ALTER TABLE tx ADD COLUMN IF NOT EXISTS transfer_id TEXT;
+CREATE TABLE IF NOT EXISTS transfers (
+  id TEXT PRIMARY KEY,
+  from_user TEXT NOT NULL,
+  to_user TEXT NOT NULL,
+  amount NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+  tx_date TEXT NOT NULL,
+  notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected','cancelled','deleted')),
+  ts BIGINT NOT NULL,
+  done_ts BIGINT
+);
+CREATE INDEX IF NOT EXISTS transfers_from_idx ON transfers (from_user);
+CREATE INDEX IF NOT EXISTS transfers_to_idx ON transfers (to_user);
 CREATE INDEX IF NOT EXISTS tx_party_idx ON tx (party_id);
 CREATE TABLE IF NOT EXISTS tx_history (
   id BIGSERIAL PRIMARY KEY,
@@ -124,20 +138,22 @@ const sign = (u) => jwt.sign({ sub: u }, SECRET, { expiresIn: '7d', algorithm: '
 const rowTx = (r) => ({
   id: r.id, user: r.username, type: r.kind, amount: Number(r.amount),
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
-  party: r.party_id || null, edited: !!r.edited, photo: !!r.has_photo,
+  party: r.party_id || null, edited: !!r.edited, photo: !!r.has_photo, transfer: r.transfer_id || null,
 });
+const rowTr = (r) => ({ id: r.id, from: r.from_user, to: r.to_user, amount: Number(r.amount), date: r.tx_date, notes: r.notes,
+  status: r.status, ts: Number(r.ts), doneTs: r.done_ts == null ? null : Number(r.done_ts) });
 const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings
+// action: tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
 // Entry history: every add / edit / delete / restore is stored with who, when and what changed.
 // Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
 const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
 const snap = (r) => ({ id: r.id, username: r.username, kind: r.kind, amount: Number(r.amount), tx_date: r.tx_date, tx_time: r.tx_time,
-  notes: r.notes, descr: r.descr, ts: Number(r.ts), party_id: r.party_id || null });
+  notes: r.notes, descr: r.descr, ts: Number(r.ts), party_id: r.party_id || null, transfer_id: r.transfer_id || null });
 async function logHist(txRow, actor, action, before) {
   try {
     let changes = null;
@@ -240,6 +256,12 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     parties: (admin
       ? await pool.query('SELECT * FROM parties ORDER BY owner, lower(name)')
       : await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
+    // Transfers: users see the ones they sent or received; the admin sees all (read-only).
+    transfers: (admin
+      ? await pool.query('SELECT * FROM transfers ORDER BY ts DESC LIMIT 200')
+      : await pool.query('SELECT * FROM transfers WHERE from_user = $1 OR to_user = $1 ORDER BY ts DESC LIMIT 100', [req.user.username])).rows.map(rowTr),
+    // Other (non-admin) users a user can send a transfer to.
+    peers: admin ? [] : (await pool.query("SELECT username FROM users WHERE role = 'user' AND username <> $1 ORDER BY username", [req.user.username])).rows.map((x) => x.username),
   });
 }));
 
@@ -320,6 +342,7 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   if (!cur.rowCount || (req.user.role !== 'admin' && cur.rows[0].username !== req.user.username))
     return res.status(404).json({ error: 'Entry not found' });
   const v = p.v;
+  if (cur.rows[0].transfer_id) return editTransferTx(req, res, cur.rows[0], v);
   if (!(await partyOk(v.party, cur.rows[0].username))) return res.status(400).json({ error: 'Unknown party' });
   const { rows } = await pool.query(
     'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7, party_id=$8 WHERE id=$1 RETURNING *',
@@ -329,13 +352,36 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
   res.json(rowTx({ ...rows[0], edited: true }));
 }));
 
+// A transfer's two entries (Cash Out for the sender, Cash In for the receiver) stay identical:
+// only the amount and description can change, and both entries change together.
+async function editTransferTx(req, res, cur, v) {
+  const pair = (await pool.query('SELECT * FROM tx WHERE transfer_id = $1', [cur.transfer_id])).rows;
+  let mine = null;
+  for (const b of pair) {
+    const { rows } = await pool.query('UPDATE tx SET amount = $2, descr = $3 WHERE id = $1 RETURNING *', [b.id, v.amount, v.desc]);
+    await logHist(rows[0], req.user.username, 'edit', b);
+    if (Number(b.amount) !== v.amount) await logAct(req.user.username, b.username, 'tx_edit', rows[0], b.amount);
+    if (b.id === cur.id) mine = rows[0];
+  }
+  await pool.query('UPDATE transfers SET amount = $2, notes = $3 WHERE id = $1', [cur.transfer_id, v.amount, v.desc]);
+  res.json(rowTx({ ...mine, edited: true }));
+}
+
 app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
   const r = req.user.role === 'admin'
     ? await pool.query('DELETE FROM tx WHERE id = $1 RETURNING *', [req.params.id])
     : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
   if (!r.rowCount) return res.status(404).json({ error: 'Entry not found' });
-  await logAct(req.user.username, r.rows[0].username, 'tx_delete', r.rows[0]);
-  await logHist(r.rows[0], req.user.username, 'delete');
+  const gone = r.rows.slice();
+  // Deleting one side of a transfer deletes the other side too.
+  if (r.rows[0].transfer_id) {
+    gone.push(...(await pool.query('DELETE FROM tx WHERE transfer_id = $1 RETURNING *', [r.rows[0].transfer_id])).rows);
+    await pool.query("UPDATE transfers SET status = 'deleted' WHERE id = $1", [r.rows[0].transfer_id]);
+  }
+  for (const g of gone) {
+    await logAct(req.user.username, g.username, 'tx_delete', g);
+    await logHist(g, req.user.username, 'delete');
+  }
   res.json({ ok: true });
 }));
 
@@ -406,13 +452,73 @@ app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   const exists = await pool.query('SELECT 1 FROM tx WHERE id = $1', [s.id]);
   if (exists.rowCount) return res.status(409).json({ error: 'This entry is already back' });
   const pty = s.party_id ? (await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [s.party_id, s.username])).rowCount ? s.party_id : null : null;
-  const r = await pool.query(
-    'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-    [s.id, s.username, s.kind, s.amount, s.tx_date, s.tx_time, s.notes, s.descr, s.ts, pty]);
-  await logHist(r.rows[0], req.user.username, 'restore');
-  await logAct(req.user.username, s.username, 'tx_restore', r.rows[0]);
-  res.json(rowTx(r.rows[0]));
+  const list = [{ ...s, party_id: pty }];
+  // Restoring one side of a transfer brings back the other side as well.
+  if (s.transfer_id) {
+    const o = await pool.query(
+      `SELECT snapshot FROM tx_history h WHERE action = 'delete' AND snapshot->>'transfer_id' = $1 AND tx_id <> $2
+       AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = h.tx_id) ORDER BY ts DESC LIMIT 1`, [s.transfer_id, s.id]);
+    if (o.rowCount) list.push({ ...o.rows[0].snapshot, party_id: null });
+    await pool.query("UPDATE transfers SET status = 'accepted' WHERE id = $1", [s.transfer_id]);
+  }
+  let first = null;
+  for (const x of list) {
+    const r = await pool.query(
+      'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id, transfer_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [x.id, x.username, x.kind, x.amount, x.tx_date, x.tx_time, x.notes, x.descr, x.ts, x.party_id, x.transfer_id || null]);
+    await logHist(r.rows[0], req.user.username, 'restore');
+    await logAct(req.user.username, x.username, 'tx_restore', r.rows[0]);
+    first = first || r.rows[0];
+  }
+  res.json(rowTx(first));
 }));
+
+// Transfers between users (not the admin). Nothing is added to either cashbook until the receiver
+// accepts; then the sender gets a Cash Out and the receiver a Cash In, linked by transfer_id.
+const noAdmin = (req, res, next) =>
+  req.user.role === 'user' ? next() : res.status(403).json({ error: 'Transfers are only between users' });
+app.post('/api/transfers', auth, noAdmin, wrap(async (req, res) => {
+  const to = uname(req.body.to), amount = Math.round(Number(req.body.amount) * 100) / 100, date = String(req.body.date || '');
+  const notes = String(req.body.notes || '').trim().slice(0, 200);
+  if (!to || to === req.user.username) return res.status(400).json({ error: 'Choose who to send to' });
+  const u = await pool.query('SELECT role FROM users WHERE username = $1', [to]);
+  if (!u.rowCount || u.rows[0].role !== 'user') return res.status(400).json({ error: 'Choose who to send to' });
+  if (!(amount > 0 && amount < 1e11)) return res.status(400).json({ error: 'Enter a valid amount' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) return res.status(400).json({ error: 'Invalid date' });
+  const { rows } = await pool.query('INSERT INTO transfers (id, from_user, to_user, amount, tx_date, notes, ts) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+    [crypto.randomUUID(), req.user.username, to, amount, date, notes, Date.now()]);
+  await logAct(req.user.username, to, 'tr_send', { kind: 'in', amount, notes });
+  res.json(rowTr(rows[0]));
+}));
+// Moves a pending transfer on: the receiver accepts or rejects, the sender cancels.
+async function decide(req, res, who, status, fn) {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const { rows } = await c.query('SELECT * FROM transfers WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const t = rows[0];
+    if (!t || t[who] !== req.user.username) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Transfer not found' }); }
+    if (t.status !== 'pending') { await c.query('ROLLBACK'); return res.status(409).json({ error: 'This transfer was already ' + t.status }); }
+    const made = fn ? await fn(c, t) : [];
+    const u = await c.query('UPDATE transfers SET status = $2, done_ts = $3 WHERE id = $1 RETURNING *', [t.id, status, Date.now()]);
+    await c.query('COMMIT');
+    for (const m of made) await logHist(m, req.user.username, 'add');
+    await logAct(req.user.username, who === 'to_user' ? t.from_user : t.to_user, 'tr_' + (status === 'accepted' ? 'accept' : status === 'rejected' ? 'reject' : 'cancel'),
+      { kind: who === 'to_user' ? 'out' : 'in', amount: t.amount, notes: t.notes });
+    res.json(rowTr(u.rows[0]));
+  } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; } finally { c.release(); }
+}
+app.post('/api/transfers/:id/accept', auth, noAdmin, wrap(async (req, res) => {
+  const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(req.body.time || '') ? req.body.time : '';
+  await decide(req, res, 'to_user', 'accepted', async (c, t) => {
+    const ins = (user, kind, notes) => c.query(
+      'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, transfer_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [crypto.randomUUID(), user, kind, t.amount, t.tx_date, time, notes, t.notes, Date.now(), t.id]);
+    return [(await ins(t.from_user, 'out', '⇄ To ' + t.to_user)).rows[0], (await ins(t.to_user, 'in', '⇄ From ' + t.from_user)).rows[0]];
+  });
+}));
+app.post('/api/transfers/:id/reject', auth, noAdmin, wrap((req, res) => decide(req, res, 'to_user', 'rejected')));
+app.post('/api/transfers/:id/cancel', auth, noAdmin, wrap((req, res) => decide(req, res, 'from_user', 'cancelled')));
 
 // Parties (customers, suppliers, staff): only the user who added a party can change it; the admin can view all.
 function parseParty(b) {
