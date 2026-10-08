@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS parties (
   ts BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS due TEXT NOT NULL DEFAULT '';
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
 CREATE INDEX IF NOT EXISTS tx_party_idx ON tx (party_id);
 CREATE TABLE IF NOT EXISTS tx_history (
@@ -125,7 +126,7 @@ const rowTx = (r) => ({
   date: r.tx_date, time: r.tx_time, notes: r.notes, desc: r.descr, ts: Number(r.ts),
   party: r.party_id || null, edited: !!r.edited, photo: !!r.has_photo,
 });
-const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, ts: Number(r.ts) });
+const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
@@ -415,16 +416,18 @@ app.post('/api/deleted/:id/restore', auth, adminOnly, wrap(async (req, res) => {
 function parseParty(b) {
   const name = String(b.name || '').trim().slice(0, 80), phone = String(b.phone || '').replace(/[^\d+ ]/g, '').trim().slice(0, 20);
   const kind = ['customer', 'supplier', 'staff', 'other'].includes(b.kind) ? b.kind : 'customer';
+  // Optional payment due date (YYYY-MM-DD); empty clears it.
+  const due = /^\d{4}-\d{2}-\d{2}$/.test(b.due || '') && !isNaN(Date.parse(b.due)) ? b.due : '';
   if (!name) return { error: 'Enter a name' };
-  return { v: { name, phone, kind } };
+  return { v: { name, phone, kind, due } };
 }
 app.post('/api/parties', auth, wrap(async (req, res) => {
   const p = parseParty(req.body);
   if (p.error) return res.status(400).json({ error: p.error });
   const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2)', [req.user.username, p.v.name]);
   if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
-  const { rows } = await pool.query('INSERT INTO parties (id, owner, name, phone, kind, ts) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [crypto.randomUUID(), req.user.username, p.v.name, p.v.phone, p.v.kind, Date.now()]);
+  const { rows } = await pool.query('INSERT INTO parties (id, owner, name, phone, kind, due, ts) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+    [crypto.randomUUID(), req.user.username, p.v.name, p.v.phone, p.v.kind, p.v.due, Date.now()]);
   res.json(rowParty(rows[0]));
 }));
 app.put('/api/parties/:id', auth, wrap(async (req, res) => {
@@ -432,8 +435,8 @@ app.put('/api/parties/:id', auth, wrap(async (req, res) => {
   if (p.error) return res.status(400).json({ error: p.error });
   const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2) AND id <> $3', [req.user.username, p.v.name, req.params.id]);
   if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
-  const { rows } = await pool.query('UPDATE parties SET name = $3, phone = $4, kind = $5 WHERE id = $1 AND owner = $2 RETURNING *',
-    [req.params.id, req.user.username, p.v.name, p.v.phone, p.v.kind]);
+  const { rows } = await pool.query('UPDATE parties SET name = $3, phone = $4, kind = $5, due = $6 WHERE id = $1 AND owner = $2 RETURNING *',
+    [req.params.id, req.user.username, p.v.name, p.v.phone, p.v.kind, p.v.due]);
   if (!rows.length) return res.status(404).json({ error: 'Party not found' });
   res.json(rowParty(rows[0]));
 }));
