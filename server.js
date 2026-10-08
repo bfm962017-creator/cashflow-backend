@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS parties (
 );
 CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
 ALTER TABLE parties ADD COLUMN IF NOT EXISTS due TEXT NOT NULL DEFAULT '';
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS common BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS transfer_id TEXT;
 CREATE TABLE IF NOT EXISTS transfers (
@@ -158,7 +159,7 @@ const rowTx = (r) => ({
 const rowTr = (r) => ({ id: r.id, from: r.from_user, to: r.to_user, amount: Number(r.amount), date: r.tx_date, notes: r.notes,
   status: r.status, ts: Number(r.ts), doneTs: r.done_ts == null ? null : Number(r.done_ts),
   req: r.req_kind ? { kind: r.req_kind, by: r.req_by, amount: r.req_amount == null ? null : Number(r.req_amount), notes: r.req_notes || '', ts: Number(r.req_ts) } : null });
-const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', ts: Number(r.ts) });
+const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', common: !!r.common, ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
@@ -283,11 +284,14 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
     biz: await bizInfo(false),
-    // Users get only their own parties; the admin also gets everyone's, read-only (edits stay owner-only).
+    // Users get their own parties plus the common ones; the admin gets everything.
     photoBytes: admin ? Number((await pool.query('SELECT COALESCE(SUM(bytes),0) AS b FROM tx_photos')).rows[0].b) : undefined,
     parties: (admin
       ? await pool.query('SELECT * FROM parties ORDER BY owner, lower(name)')
-      : await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
+      : await pool.query('SELECT * FROM parties WHERE owner = $1 OR common ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
+    // Common parties keep one combined ledger: users also get other users' entries with them (read-only).
+    ctxs: admin ? [] : (await pool.query(TX_SELECT + ' WHERE username <> $1 AND party_id IN (SELECT id FROM parties WHERE common) ORDER BY tx_date, tx_time, ts',
+      [req.user.username])).rows.map(rowTx),
     // Transfers: users see the ones they sent or received; the admin sees all (read-only).
     // Anything still waiting on someone is always included; finished ones only the latest 100 / 200.
     transfers: (admin
@@ -369,10 +373,10 @@ function parseTx(b) {
   const party = b.party ? String(b.party) : null;
   return { v: { type, amount, date, time, notes, desc, party } };
 }
-// A party can only be attached to entries in the cashbook of the user who added that party.
+// An entry can use a party its cashbook's user added, or any common party.
 async function partyOk(party, owner) {
   if (!party) return true;
-  const r = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [party, owner]);
+  const r = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND (owner = $2 OR common)', [party, owner]);
   return r.rowCount > 0;
 }
 
@@ -544,7 +548,7 @@ app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   if (!rows.length || (req.user.role !== 'admin' && rows[0].owner !== req.user.username)) return res.status(404).json({ error: 'Not found' });
   const s = rows[0].snapshot, c = await lockCutoff(req);
   if (c && s.tx_date < c) return locked(res, c);
-  const pty = s.party_id ? (await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [s.party_id, s.username])).rowCount ? s.party_id : null : null;
+  const pty = s.party_id && (await partyOk(s.party_id, s.username)) ? s.party_id : null;
   const back = await atomic(async (c) => {
     // Lock the row id so two people restoring at once cannot both succeed.
     if ((await c.query('SELECT 1 FROM tx WHERE id = $1 FOR UPDATE', [s.id])).rowCount) return null;
@@ -664,7 +668,9 @@ app.post('/api/transfers/:id/request/:answer', auth, noAdmin(TRANSFER_USERS), wr
   return { t: (await c.query('SELECT * FROM transfers WHERE id = $1', [t.id])).rows[0], acts };
 })));
 
-// Parties (customers, suppliers, staff): only the user who added a party can change it; the admin can view all.
+// Parties (customers, suppliers, staff). A user's parties are private: only they can change them.
+// Common parties are added by the admin, shared by everyone, and only the admin can change them.
+// A private party may have the same name as a common one; they stay separate.
 function parseParty(b) {
   const name = String(b.name || '').trim().slice(0, 80), phone = String(b.phone || '').replace(/[^\d+ ]/g, '').trim().slice(0, 20);
   const kind = ['customer', 'supplier', 'staff', 'other'].includes(b.kind) ? b.kind : 'customer';
@@ -673,31 +679,38 @@ function parseParty(b) {
   if (!name) return { error: 'Enter a name' };
   return { v: { name, phone, kind, due } };
 }
-app.post('/api/parties', auth, noAdmin('The admin does not add parties'), wrap(async (req, res) => {
-  const p = parseParty(req.body);
+// The parties the caller may change: the admin its common parties, a user their private ones.
+const editable = (req) => req.user.role === 'admin' ? ['common', []] : ['owner = $X AND NOT common', [req.user.username]];
+async function dupName(req, name, id) {
+  const [w, a] = editable(req);
+  const q = await pool.query('SELECT 1 FROM parties WHERE ' + w.replace('$X', '$2') + ' AND lower(name) = lower($1)' + (id ? ' AND id <> $' + (a.length + 2) : ''),
+    [name, ...a, ...(id ? [id] : [])]);
+  return q.rowCount > 0;
+}
+app.post('/api/parties', auth, wrap(async (req, res) => {
+  const p = parseParty(req.body), common = req.user.role === 'admin';
   if (p.error) return res.status(400).json({ error: p.error });
-  const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2)', [req.user.username, p.v.name]);
-  if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
-  const { rows } = await pool.query('INSERT INTO parties (id, owner, name, phone, kind, due, ts) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-    [crypto.randomUUID(), req.user.username, p.v.name, p.v.phone, p.v.kind, p.v.due, Date.now()]);
+  if (await dupName(req, p.v.name)) return res.status(409).json({ error: common ? 'There is already a common party with that name' : 'You already have a party with that name' });
+  const { rows } = await pool.query('INSERT INTO parties (id, owner, name, phone, kind, due, common, ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+    [crypto.randomUUID(), req.user.username, p.v.name, p.v.phone, p.v.kind, p.v.due, common, Date.now()]);
   res.json(rowParty(rows[0]));
 }));
 app.put('/api/parties/:id', auth, wrap(async (req, res) => {
-  const p = parseParty(req.body);
+  const p = parseParty(req.body), [w, a] = editable(req);
   if (p.error) return res.status(400).json({ error: p.error });
-  const dup = await pool.query('SELECT 1 FROM parties WHERE owner = $1 AND lower(name) = lower($2) AND id <> $3', [req.user.username, p.v.name, req.params.id]);
-  if (dup.rowCount) return res.status(409).json({ error: 'You already have a party with that name' });
-  const { rows } = await pool.query('UPDATE parties SET name = $3, phone = $4, kind = $5, due = $6 WHERE id = $1 AND owner = $2 RETURNING *',
-    [req.params.id, req.user.username, p.v.name, p.v.phone, p.v.kind, p.v.due]);
+  if (await dupName(req, p.v.name, req.params.id)) return res.status(409).json({ error: req.user.role === 'admin' ? 'There is already a common party with that name' : 'You already have a party with that name' });
+  const { rows } = await pool.query('UPDATE parties SET name = $2, phone = $3, kind = $4, due = $5 WHERE id = $1 AND ' + w.replace('$X', '$6') + ' RETURNING *',
+    [req.params.id, p.v.name, p.v.phone, p.v.kind, p.v.due, ...a]);
   if (!rows.length) return res.status(404).json({ error: 'Party not found' });
   res.json(rowParty(rows[0]));
 }));
 app.delete('/api/parties/:id', auth, wrap(async (req, res) => {
-  const mine = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [req.params.id, req.user.username]);
+  const [w, a] = editable(req);
+  const mine = await pool.query('SELECT 1 FROM parties WHERE id = $1 AND ' + w.replace('$X', '$2'), [req.params.id, ...a]);
   if (!mine.rowCount) return res.status(404).json({ error: 'Party not found' });
   const used = await pool.query('SELECT 1 FROM tx WHERE party_id = $1 LIMIT 1', [req.params.id]);
   if (used.rowCount) return res.status(409).json({ error: 'This party has entries. Delete those entries first.' });
-  await pool.query('DELETE FROM parties WHERE id = $1 AND owner = $2', [req.params.id, req.user.username]);
+  await pool.query('DELETE FROM parties WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
 }));
 
