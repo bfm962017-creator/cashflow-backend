@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS transfers (
 );
 CREATE INDEX IF NOT EXISTS transfers_from_idx ON transfers (from_user);
 CREATE INDEX IF NOT EXISTS transfers_to_idx ON transfers (to_user);
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS req_kind TEXT;
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS req_by TEXT;
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS req_amount NUMERIC(14,2);
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS req_notes TEXT;
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS req_ts BIGINT;
+CREATE TABLE IF NOT EXISTS meta (id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1), rev BIGINT NOT NULL DEFAULT 0);
+INSERT INTO meta (id) VALUES (1) ON CONFLICT DO NOTHING;
 CREATE INDEX IF NOT EXISTS tx_party_idx ON tx (party_id);
 CREATE TABLE IF NOT EXISTS tx_history (
   id BIGSERIAL PRIMARY KEY,
@@ -125,6 +132,13 @@ app.use((req, res, next) => {
 // The business logo is sent as a data URL, so the settings route gets a bigger body limit.
 const jsonSmall = express.json({ limit: '50kb' }), jsonBig = express.json({ limit: '400kb' });
 app.use((req, res, next) => (req.path === '/api/settings' || /^\/api\/tx\/[^/]+\/photo$/.test(req.path) ? jsonBig : jsonSmall)(req, res, next));
+// Every successful change bumps one revision number. Phones poll /api/rev (a few bytes) and only
+// download everything again when it moved, instead of pulling all entries every 20 seconds.
+app.use('/api', (req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'OPTIONS' && !/^\/(login|activity\/seen)$/.test(req.path))
+    res.on('finish', () => { if (res.statusCode < 400) pool.query('UPDATE meta SET rev = rev + 1 WHERE id = 1').catch(() => {}); });
+  next();
+});
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -142,32 +156,45 @@ const rowTx = (r) => ({
   party: r.party_id || null, edited: !!r.edited, photo: !!r.has_photo, transfer: r.transfer_id || null,
 });
 const rowTr = (r) => ({ id: r.id, from: r.from_user, to: r.to_user, amount: Number(r.amount), date: r.tx_date, notes: r.notes,
-  status: r.status, ts: Number(r.ts), doneTs: r.done_ts == null ? null : Number(r.done_ts) });
+  status: r.status, ts: Number(r.ts), doneTs: r.done_ts == null ? null : Number(r.done_ts),
+  req: r.req_kind ? { kind: r.req_kind, by: r.req_by, amount: r.req_amount == null ? null : Number(r.req_amount), notes: r.req_notes || '', ts: Number(r.req_ts) } : null });
 const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', ts: Number(r.ts) });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: lock | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
+// action: lock | tr_req | tr_req_agree | tr_req_refuse | tr_req_withdraw | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
 // Entry history: every add / edit / delete / restore is stored with who, when and what changed.
 // Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
 const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
 const snap = (r) => ({ id: r.id, username: r.username, kind: r.kind, amount: Number(r.amount), tx_date: r.tx_date, tx_time: r.tx_time,
   notes: r.notes, descr: r.descr, ts: Number(r.ts), party_id: r.party_id || null, transfer_id: r.transfer_id || null });
-async function logHist(txRow, actor, action, before) {
-  try {
-    let changes = null;
-    if (action === 'edit') {
-      const a = snap(before), b = snap(txRow);
-      changes = {};
-      HIST_FIELDS.forEach((f) => { if (String(a[f] ?? '') !== String(b[f] ?? '')) changes[f] = [a[f], b[f]]; });
-      if (!Object.keys(changes).length) return;
-    }
-    await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes, snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [txRow.id, txRow.username, Date.now(), actor, action, changes, action === 'edit' ? null : snap(txRow)]);
-  } catch (e) { console.error('history log failed:', e.message); }
+// With db (a transaction client) a failure undoes the whole change, so an entry never changes
+// without its history record; without it, a failed history write is only logged.
+async function logHist(txRow, actor, action, before, db) {
+  let changes = null;
+  if (action === 'edit') {
+    const a = snap(before), b = snap(txRow);
+    changes = {};
+    HIST_FIELDS.forEach((f) => { if (String(a[f] ?? '') !== String(b[f] ?? '')) changes[f] = [a[f], b[f]]; });
+    if (!Object.keys(changes).length) return;
+  }
+  const run = () => (db || pool).query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes, snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [txRow.id, txRow.username, Date.now(), actor, action, changes, action === 'edit' ? null : snap(txRow)]);
+  if (db) return run();
+  try { await run(); } catch (e) { console.error('history log failed:', e.message); }
 }
+// Runs fn(client) as one database transaction: either every step is saved or none is.
+async function atomic(fn) {
+  const c = await pool.connect();
+  try { await c.query('BEGIN'); const out = await fn(c); await c.query('COMMIT'); return out; }
+  catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; }
+  finally { c.release(); }
+}
+// A real calendar date as YYYY-MM-DD (rejects impossible ones like 2026-02-31).
+const validDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s)) &&
+  new Date(s + 'T00:00:00Z').toISOString().slice(0, 10) === s;
 async function logAct(actor, owner, action, tx, prev) {
   try {
     await pool.query(
@@ -246,9 +273,10 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     users[req.user.username] = { name: req.user.username, role: req.user.role };
   }
   const a = admin
-    ? await pool.query('SELECT * FROM activity ORDER BY ts DESC LIMIT 50')
-    : await pool.query('SELECT * FROM activity WHERE owner = $1 ORDER BY ts DESC LIMIT 50', [req.user.username]);
+    ? await pool.query('SELECT * FROM activity ORDER BY ts DESC LIMIT 100')
+    : await pool.query('SELECT * FROM activity WHERE owner = $1 ORDER BY ts DESC LIMIT 100', [req.user.username]);
   res.json({
+    rev: Number((await pool.query('SELECT rev FROM meta WHERE id = 1')).rows[0].rev),
     me: { name: req.user.username, role: req.user.role }, users, txs: t.rows.map(rowTx),
     activity: a.rows.map(rowAct), seenAt: Number(req.user.seen_at),
     biz: await bizInfo(false),
@@ -258,9 +286,12 @@ app.get('/api/data', auth, wrap(async (req, res) => {
       ? await pool.query('SELECT * FROM parties ORDER BY owner, lower(name)')
       : await pool.query('SELECT * FROM parties WHERE owner = $1 ORDER BY lower(name)', [req.user.username])).rows.map(rowParty),
     // Transfers: users see the ones they sent or received; the admin sees all (read-only).
+    // Anything still waiting on someone is always included; finished ones only the latest 100 / 200.
     transfers: (admin
-      ? await pool.query('SELECT * FROM transfers ORDER BY ts DESC LIMIT 200')
-      : await pool.query('SELECT * FROM transfers WHERE from_user = $1 OR to_user = $1 ORDER BY ts DESC LIMIT 100', [req.user.username])).rows.map(rowTr),
+      ? await pool.query(`SELECT * FROM transfers WHERE status = 'pending' OR req_kind IS NOT NULL
+          UNION SELECT * FROM (SELECT * FROM transfers ORDER BY ts DESC LIMIT 200) x ORDER BY ts DESC`)
+      : await pool.query(`SELECT * FROM transfers WHERE (from_user = $1 OR to_user = $1) AND (status = 'pending' OR req_kind IS NOT NULL)
+          UNION SELECT * FROM (SELECT * FROM transfers WHERE from_user = $1 OR to_user = $1 ORDER BY ts DESC LIMIT 100) x ORDER BY ts DESC`, [req.user.username])).rows.map(rowTr),
     // Other (non-admin) users a user can send a transfer to.
     peers: admin ? [] : (await pool.query("SELECT username FROM users WHERE role = 'user' AND username <> $1 ORDER BY username", [req.user.username])).rows.map((x) => x.username),
   });
@@ -291,6 +322,10 @@ app.put('/api/settings', auth, adminOnly, wrap(async (req, res) => {
     await pool.query('UPDATE settings SET name = $1, address = $2, logo = $3, updated = $4 WHERE id = 1', [name, address, logo || null, Date.now()]);
   await logAct(req.user.username, req.user.username, 'settings');
   res.json(await bizInfo(true));
+}));
+
+app.get('/api/rev', auth, wrap(async (req, res) => {
+  res.json({ rev: Number((await pool.query('SELECT rev FROM meta WHERE id = 1')).rows[0].rev) });
 }));
 
 app.post('/api/activity/seen', auth, wrap(async (req, res) => {
@@ -326,7 +361,7 @@ function parseTx(b) {
   const notes = String(b.notes || '').trim().slice(0, 500), desc = String(b.desc || '').trim().slice(0, 500);
   if (type !== 'in' && type !== 'out') return { error: 'Invalid type' };
   if (!(amount > 0 && amount < 1e11)) return { error: 'Enter a valid amount' };
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) return { error: 'Invalid date' };
+  if (!validDate(date)) return { error: 'Invalid date' };
   if (time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return { error: 'Invalid time' };
   const party = b.party ? String(b.party) : null;
   return { v: { type, amount, date, time, notes, desc, party } };
@@ -350,12 +385,15 @@ app.post('/api/tx', auth, wrap(async (req, res) => {
   const v = p.v, id = crypto.randomUUID(), c = await lockCutoff(req);
   if (c && v.date < c) return locked(res, c);
   if (!(await partyOk(v.party, owner))) return res.status(400).json({ error: 'Unknown party' });
-  const { rows } = await pool.query(
-    'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-    [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now(), v.party]);
-  await logAct(req.user.username, owner, 'tx_add', rows[0]);
-  await logHist(rows[0], req.user.username, 'add');
-  res.json(rowTx(rows[0]));
+  const row = await atomic(async (c) => {
+    const { rows } = await c.query(
+      'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [id, owner, v.type, v.amount, v.date, v.time, v.notes, v.desc, Date.now(), v.party]);
+    await logHist(rows[0], req.user.username, 'add', null, c);
+    return rows[0];
+  });
+  await logAct(req.user.username, owner, 'tx_add', row);
+  res.json(rowTx(row));
 }));
 
 app.put('/api/tx/:id', auth, wrap(async (req, res) => {
@@ -366,29 +404,47 @@ app.put('/api/tx/:id', auth, wrap(async (req, res) => {
     return res.status(404).json({ error: 'Entry not found' });
   const v = p.v, c = await lockCutoff(req);
   if (c && (cur.rows[0].tx_date < c || v.date < c)) return locked(res, c);
-  if (cur.rows[0].transfer_id) return editTransferTx(req, res, cur.rows[0], v);
+  if (cur.rows[0].transfer_id) {
+    // A user changing a transfer needs the other user's OK (POST /api/transfers/:id/request).
+    if (req.user.role !== 'admin') return res.status(409).json({ error: 'Changes to a transfer need the other user\'s OK' });
+    return editTransferTx(req, res, cur.rows[0], v);
+  }
   if (!(await partyOk(v.party, cur.rows[0].username))) return res.status(400).json({ error: 'Unknown party' });
-  const { rows } = await pool.query(
-    'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7, party_id=$8 WHERE id=$1 RETURNING *',
-    [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc, v.party]);
-  await logAct(req.user.username, rows[0].username, 'tx_edit', rows[0], cur.rows[0].amount);
-  await logHist(rows[0], req.user.username, 'edit', cur.rows[0]);
-  res.json(rowTx({ ...rows[0], edited: true }));
+  const row = await atomic(async (c) => {
+    const { rows } = await c.query(
+      'UPDATE tx SET kind=$2, amount=$3, tx_date=$4, tx_time=$5, notes=$6, descr=$7, party_id=$8 WHERE id=$1 RETURNING *',
+      [req.params.id, v.type, v.amount, v.date, v.time, v.notes, v.desc, v.party]);
+    await logHist(rows[0], req.user.username, 'edit', cur.rows[0], c);
+    return rows[0];
+  });
+  await logAct(req.user.username, row.username, 'tx_edit', row, cur.rows[0].amount);
+  res.json(rowTx({ ...row, edited: true }));
 }));
 
 // A transfer's two entries (Cash Out for the sender, Cash In for the receiver) stay identical:
 // only the amount and description can change, and both entries change together.
-async function editTransferTx(req, res, cur, v) {
-  const pair = (await pool.query('SELECT * FROM tx WHERE transfer_id = $1', [cur.transfer_id])).rows;
-  let mine = null;
+async function changeTransfer(c, transferId, actor, amount, desc) {
+  const pair = (await c.query('SELECT * FROM tx WHERE transfer_id = $1 FOR UPDATE', [transferId])).rows, out = [];
   for (const b of pair) {
-    const { rows } = await pool.query('UPDATE tx SET amount = $2, descr = $3 WHERE id = $1 RETURNING *', [b.id, v.amount, v.desc]);
-    await logHist(rows[0], req.user.username, 'edit', b);
-    if (Number(b.amount) !== v.amount) await logAct(req.user.username, b.username, 'tx_edit', rows[0], b.amount);
-    if (b.id === cur.id) mine = rows[0];
+    const { rows } = await c.query('UPDATE tx SET amount = $2, descr = $3 WHERE id = $1 RETURNING *', [b.id, amount, desc]);
+    await logHist(rows[0], actor, 'edit', b, c);
+    out.push({ before: b, after: rows[0] });
   }
-  await pool.query('UPDATE transfers SET amount = $2, notes = $3 WHERE id = $1', [cur.transfer_id, v.amount, v.desc]);
-  res.json(rowTx({ ...mine, edited: true }));
+  await c.query('UPDATE transfers SET amount = $2, notes = $3, req_kind = NULL, req_by = NULL, req_amount = NULL, req_notes = NULL, req_ts = NULL WHERE id = $1',
+    [transferId, amount, desc]);
+  return out;
+}
+async function removeTransfer(c, transferId, actor) {
+  const gone = (await c.query('DELETE FROM tx WHERE transfer_id = $1 RETURNING *', [transferId])).rows;
+  for (const g of gone) await logHist(g, actor, 'delete', null, c);
+  await c.query("UPDATE transfers SET status = 'deleted', req_kind = NULL, req_by = NULL, req_amount = NULL, req_notes = NULL, req_ts = NULL WHERE id = $1", [transferId]);
+  return gone;
+}
+async function editTransferTx(req, res, cur, v) {
+  const out = await atomic((c) => changeTransfer(c, cur.transfer_id, req.user.username, v.amount, v.desc));
+  for (const x of out) if (Number(x.before.amount) !== v.amount) await logAct(req.user.username, x.after.username, 'tx_edit', x.after, x.before.amount);
+  const mine = out.find((x) => x.after.id === cur.id);
+  res.json(rowTx({ ...(mine ? mine.after : cur), edited: true }));
 }
 
 app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
@@ -397,20 +453,21 @@ app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
     const o = await pool.query('SELECT tx_date FROM tx WHERE id = $1 AND username = $2', [req.params.id, req.user.username]);
     if (o.rowCount && o.rows[0].tx_date < c) return locked(res, c);
   }
-  const r = req.user.role === 'admin'
-    ? await pool.query('DELETE FROM tx WHERE id = $1 RETURNING *', [req.params.id])
-    : await pool.query('DELETE FROM tx WHERE id = $1 AND username = $2 RETURNING *', [req.params.id, req.user.username]);
-  if (!r.rowCount) return res.status(404).json({ error: 'Entry not found' });
-  const gone = r.rows.slice();
-  // Deleting one side of a transfer deletes the other side too.
-  if (r.rows[0].transfer_id) {
-    gone.push(...(await pool.query('DELETE FROM tx WHERE transfer_id = $1 RETURNING *', [r.rows[0].transfer_id])).rows);
-    await pool.query("UPDATE transfers SET status = 'deleted' WHERE id = $1", [r.rows[0].transfer_id]);
-  }
-  for (const g of gone) {
-    await logAct(req.user.username, g.username, 'tx_delete', g);
-    await logHist(g, req.user.username, 'delete');
-  }
+  const cur = req.user.role === 'admin'
+    ? await pool.query('SELECT * FROM tx WHERE id = $1', [req.params.id])
+    : await pool.query('SELECT * FROM tx WHERE id = $1 AND username = $2', [req.params.id, req.user.username]);
+  if (!cur.rowCount) return res.status(404).json({ error: 'Entry not found' });
+  const t = cur.rows[0];
+  // Deleting one side of a transfer deletes the other side too; a user needs the other user's OK.
+  if (t.transfer_id && req.user.role !== 'admin') return res.status(409).json({ error: 'Deleting a transfer needs the other user\'s OK' });
+  const gone = await atomic(async (c) => {
+    if (t.transfer_id) return removeTransfer(c, t.transfer_id, req.user.username);
+    const r = await c.query('DELETE FROM tx WHERE id = $1 RETURNING *', [t.id]);
+    for (const g of r.rows) await logHist(g, req.user.username, 'delete', null, c);
+    return r.rows;
+  });
+  if (!gone.length) return res.status(404).json({ error: 'Entry not found' });
+  for (const g of gone) await logAct(req.user.username, g.username, 'tx_delete', g);
   res.json({ ok: true });
 }));
 
@@ -444,14 +501,16 @@ app.put('/api/tx/:id/photo', auth, wrap(async (req, res) => {
   const photo = req.body.photo;
   if (!(typeof photo === 'string' && photo.length <= 400000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(photo)))
     return res.status(400).json({ error: 'Photo must be a JPEG under 300 KB' });
-  const had = (await pool.query('SELECT 1 FROM tx_photos WHERE tx_id = $1', [req.params.id])).rowCount > 0;
   const bytes = Math.round((photo.length - 23) * 3 / 4);
-  await pool.query('INSERT INTO tx_photos (tx_id, data, bytes, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (tx_id) DO UPDATE SET data = $2, bytes = $3, ts = $4',
-    [req.params.id, photo, bytes, Date.now()]);
-  // A photo attached while the entry is being created is part of adding it, not an edit.
-  if (had || Date.now() - Number(tx.ts) > 120000)
-    await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
-      [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: [had ? 'yes' : null, had ? 'replaced' : 'added'] }]);
+  await atomic(async (c) => {
+    const had = (await c.query('SELECT 1 FROM tx_photos WHERE tx_id = $1', [req.params.id])).rowCount > 0;
+    await c.query('INSERT INTO tx_photos (tx_id, data, bytes, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (tx_id) DO UPDATE SET data = $2, bytes = $3, ts = $4',
+      [req.params.id, photo, bytes, Date.now()]);
+    // A photo attached while the entry is being created is part of adding it, not an edit.
+    if (had || Date.now() - Number(tx.ts) > 120000)
+      await c.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
+        [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: [had ? 'yes' : null, had ? 'replaced' : 'added'] }]);
+  });
   res.json({ ok: true, bytes });
 }));
 app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
@@ -459,9 +518,11 @@ app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
   if (!tx) return res.status(404).json({ error: 'Entry not found' });
   const c = await lockCutoff(req);
   if (c && tx.tx_date < c) return locked(res, c);
-  const r = await pool.query('DELETE FROM tx_photos WHERE tx_id = $1', [req.params.id]);
-  if (r.rowCount) await pool.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
-    [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: ['yes', null] }]);
+  await atomic(async (c) => {
+    const r = await c.query('DELETE FROM tx_photos WHERE tx_id = $1', [req.params.id]);
+    if (r.rowCount) await c.query('INSERT INTO tx_history (tx_id, owner, ts, actor, action, changes) VALUES ($1,$2,$3,$4,$5,$6)',
+      [req.params.id, tx.username, Date.now(), req.user.username, 'edit', { photo: ['yes', null] }]);
+  });
   res.json({ ok: true });
 }));
 
@@ -483,28 +544,32 @@ app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   if (!rows.length || (req.user.role !== 'admin' && rows[0].owner !== req.user.username)) return res.status(404).json({ error: 'Not found' });
   const s = rows[0].snapshot, c = await lockCutoff(req);
   if (c && s.tx_date < c) return locked(res, c);
-  const exists = await pool.query('SELECT 1 FROM tx WHERE id = $1', [s.id]);
-  if (exists.rowCount) return res.status(409).json({ error: 'This entry is already back' });
   const pty = s.party_id ? (await pool.query('SELECT 1 FROM parties WHERE id = $1 AND owner = $2', [s.party_id, s.username])).rowCount ? s.party_id : null : null;
-  const list = [{ ...s, party_id: pty }];
-  // Restoring one side of a transfer brings back the other side as well.
-  if (s.transfer_id) {
-    const o = await pool.query(
-      `SELECT snapshot FROM tx_history h WHERE action = 'delete' AND snapshot->>'transfer_id' = $1 AND tx_id <> $2
-       AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = h.tx_id) ORDER BY ts DESC LIMIT 1`, [s.transfer_id, s.id]);
-    if (o.rowCount) list.push({ ...o.rows[0].snapshot, party_id: null });
-    await pool.query("UPDATE transfers SET status = 'accepted' WHERE id = $1", [s.transfer_id]);
-  }
-  let first = null;
-  for (const x of list) {
-    const r = await pool.query(
-      'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id, transfer_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-      [x.id, x.username, x.kind, x.amount, x.tx_date, x.tx_time, x.notes, x.descr, x.ts, x.party_id, x.transfer_id || null]);
-    await logHist(r.rows[0], req.user.username, 'restore');
-    await logAct(req.user.username, x.username, 'tx_restore', r.rows[0]);
-    first = first || r.rows[0];
-  }
-  res.json(rowTx(first));
+  const back = await atomic(async (c) => {
+    // Lock the row id so two people restoring at once cannot both succeed.
+    if ((await c.query('SELECT 1 FROM tx WHERE id = $1 FOR UPDATE', [s.id])).rowCount) return null;
+    const list = [{ ...s, party_id: pty }];
+    // Restoring one side of a transfer brings back the other side as well.
+    if (s.transfer_id) {
+      const o = await c.query(
+        `SELECT snapshot FROM tx_history h WHERE action = 'delete' AND snapshot->>'transfer_id' = $1 AND tx_id <> $2
+         AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = h.tx_id) ORDER BY ts DESC LIMIT 1`, [s.transfer_id, s.id]);
+      if (o.rowCount) list.push({ ...o.rows[0].snapshot, party_id: null });
+      await c.query("UPDATE transfers SET status = 'accepted' WHERE id = $1", [s.transfer_id]);
+    }
+    const out = [];
+    for (const x of list) {
+      const r = await c.query(
+        'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, party_id, transfer_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+        [x.id, x.username, x.kind, x.amount, x.tx_date, x.tx_time, x.notes, x.descr, x.ts, x.party_id, x.transfer_id || null]);
+      await logHist(r.rows[0], req.user.username, 'restore', null, c);
+      out.push(r.rows[0]);
+    }
+    return out;
+  }).catch((e) => { if (e.code === '23505') return null; throw e; });
+  if (!back) return res.status(409).json({ error: 'This entry is already back' });
+  for (const x of back) await logAct(req.user.username, x.username, 'tx_restore', x);
+  res.json(rowTx(back[0]));
 }));
 
 // Transfers between users (not the admin). Nothing is added to either cashbook until the receiver
@@ -518,7 +583,7 @@ app.post('/api/transfers', auth, noAdmin, wrap(async (req, res) => {
   const u = await pool.query('SELECT role FROM users WHERE username = $1', [to]);
   if (!u.rowCount || u.rows[0].role !== 'user') return res.status(400).json({ error: 'Choose who to send to' });
   if (!(amount > 0 && amount < 1e11)) return res.status(400).json({ error: 'Enter a valid amount' });
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || isNaN(Date.parse(date))) return res.status(400).json({ error: 'Invalid date' });
+  if (!validDate(date)) return res.status(400).json({ error: 'Invalid date' });
   const c = await lockCutoff(req);
   if (c && date < c) return locked(res, c);
   const { rows } = await pool.query('INSERT INTO transfers (id, from_user, to_user, amount, tx_date, notes, ts) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
@@ -536,9 +601,9 @@ async function decide(req, res, who, status, fn) {
     if (!t || t[who] !== req.user.username) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Transfer not found' }); }
     if (t.status !== 'pending') { await c.query('ROLLBACK'); return res.status(409).json({ error: 'This transfer was already ' + t.status }); }
     const made = fn ? await fn(c, t) : [];
+    for (const m of made) await logHist(m, req.user.username, 'add', null, c);
     const u = await c.query('UPDATE transfers SET status = $2, done_ts = $3 WHERE id = $1 RETURNING *', [t.id, status, Date.now()]);
     await c.query('COMMIT');
-    for (const m of made) await logHist(m, req.user.username, 'add');
     await logAct(req.user.username, who === 'to_user' ? t.from_user : t.to_user, 'tr_' + (status === 'accepted' ? 'accept' : status === 'rejected' ? 'reject' : 'cancel'),
       { kind: who === 'to_user' ? 'out' : 'in', amount: t.amount, notes: t.notes });
     res.json(rowTr(u.rows[0]));
@@ -556,12 +621,57 @@ app.post('/api/transfers/:id/accept', auth, noAdmin, wrap(async (req, res) => {
 app.post('/api/transfers/:id/reject', auth, noAdmin, wrap((req, res) => decide(req, res, 'to_user', 'rejected')));
 app.post('/api/transfers/:id/cancel', auth, noAdmin, wrap((req, res) => decide(req, res, 'from_user', 'cancelled')));
 
+// Changing or deleting an accepted transfer: one user asks, the other agrees or refuses.
+// Until then both cashbooks stay as they are. The admin can still change transfers directly.
+async function onTransfer(req, res, fn) {
+  const r = await atomic(async (c) => {
+    const { rows } = await c.query('SELECT * FROM transfers WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const t = rows[0];
+    if (!t || (t.from_user !== req.user.username && t.to_user !== req.user.username)) return { code: 404, error: 'Transfer not found' };
+    return fn(c, t, t.from_user === req.user.username ? t.to_user : t.from_user);
+  });
+  if (r.code) return res.status(r.code).json({ error: r.error });
+  if (r.act) await logAct(req.user.username, r.act.owner, r.act.action, r.act.row, r.act.prev);
+  for (const g of r.acts || []) await logAct(req.user.username, g.owner, g.action, g.row, g.prev);
+  res.json(rowTr(r.t));
+}
+app.post('/api/transfers/:id/request', auth, noAdmin, wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
+  const kind = req.body.kind;
+  if (t.status !== 'accepted') return { code: 409, error: 'Only an accepted transfer can be changed' };
+  if (t.req_kind) return { code: 409, error: 'A request for this transfer is already waiting' };
+  if (kind !== 'edit' && kind !== 'delete') return { code: 400, error: 'Bad request' };
+  const cut = await lockCutoff(req);
+  if (cut && t.tx_date < cut) return { code: 403, error: 'Locked: entries before ' + +cut.slice(8) + ' ' + MON[+cut.slice(5, 7) - 1] + ' ' + cut.slice(0, 4) + ' can only be changed by the admin' };
+  let amount = null, notes = null;
+  if (kind === 'edit') {
+    amount = Math.round(Number(req.body.amount) * 100) / 100; notes = String(req.body.notes || '').trim().slice(0, 500);
+    if (!(amount > 0 && amount < 1e11)) return { code: 400, error: 'Enter a valid amount' };
+    if (amount === Number(t.amount) && notes === t.notes) return { code: 400, error: 'Nothing was changed' };
+  }
+  const u = await c.query('UPDATE transfers SET req_kind = $2, req_by = $3, req_amount = $4, req_notes = $5, req_ts = $6 WHERE id = $1 RETURNING *',
+    [t.id, kind, req.user.username, amount, notes, Date.now()]);
+  return { t: u.rows[0], act: { owner: other, action: 'tr_req', row: { kind, amount: kind === 'edit' ? amount : t.amount, notes: t.notes }, prev: kind === 'edit' ? t.amount : null } };
+})));
+app.post('/api/transfers/:id/request/:answer', auth, noAdmin, wrap((req, res) => onTransfer(req, res, async (c, t, other) => {
+  const a = req.params.answer;
+  if (!t.req_kind) return { code: 409, error: 'There is no request waiting' };
+  if (!['agree', 'refuse', 'withdraw'].includes(a)) return { code: 404, error: 'Not found' };
+  if ((a === 'withdraw') !== (t.req_by === req.user.username)) return { code: 403, error: a === 'withdraw' ? 'Only the person who asked can withdraw it' : 'You cannot answer your own request' };
+  const clear = () => c.query('UPDATE transfers SET req_kind = NULL, req_by = NULL, req_amount = NULL, req_notes = NULL, req_ts = NULL WHERE id = $1 RETURNING *', [t.id]);
+  const info = { kind: t.req_kind, amount: t.req_kind === 'edit' ? t.req_amount : t.amount, notes: t.notes };
+  if (a !== 'agree') return { t: (await clear()).rows[0], act: { owner: other, action: a === 'refuse' ? 'tr_req_refuse' : 'tr_req_withdraw', row: info } };
+  const acts = [{ owner: t.req_by, action: 'tr_req_agree', row: info }];
+  if (t.req_kind === 'edit') await changeTransfer(c, t.id, req.user.username, Number(t.req_amount), t.req_notes || '');
+  else await removeTransfer(c, t.id, req.user.username);
+  return { t: (await c.query('SELECT * FROM transfers WHERE id = $1', [t.id])).rows[0], acts };
+})));
+
 // Parties (customers, suppliers, staff): only the user who added a party can change it; the admin can view all.
 function parseParty(b) {
   const name = String(b.name || '').trim().slice(0, 80), phone = String(b.phone || '').replace(/[^\d+ ]/g, '').trim().slice(0, 20);
   const kind = ['customer', 'supplier', 'staff', 'other'].includes(b.kind) ? b.kind : 'customer';
   // Optional payment due date (YYYY-MM-DD); empty clears it.
-  const due = /^\d{4}-\d{2}-\d{2}$/.test(b.due || '') && !isNaN(Date.parse(b.due)) ? b.due : '';
+  const due = validDate(b.due) ? b.due : '';
   if (!name) return { error: 'Enter a name' };
   return { v: { name, phone, kind, due } };
 }
