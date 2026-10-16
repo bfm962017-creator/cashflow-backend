@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS parties (
 CREATE INDEX IF NOT EXISTS parties_owner_idx ON parties (owner);
 ALTER TABLE parties ADD COLUMN IF NOT EXISTS due TEXT NOT NULL DEFAULT '';
 ALTER TABLE parties ADD COLUMN IF NOT EXISTS common BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS share_token TEXT;
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS share_notes BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS share_views INT NOT NULL DEFAULT 0;
+ALTER TABLE parties ADD COLUMN IF NOT EXISTS share_seen BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS parties_share_idx ON parties (share_token);
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS party_id TEXT;
 ALTER TABLE tx ADD COLUMN IF NOT EXISTS transfer_id TEXT;
 CREATE TABLE IF NOT EXISTS transfers (
@@ -159,7 +164,8 @@ const rowTx = (r) => ({
 const rowTr = (r) => ({ id: r.id, from: r.from_user, to: r.to_user, amount: Number(r.amount), date: r.tx_date, notes: r.notes,
   status: r.status, ts: Number(r.ts), doneTs: r.done_ts == null ? null : Number(r.done_ts),
   req: r.req_kind ? { kind: r.req_kind, by: r.req_by, amount: r.req_amount == null ? null : Number(r.req_amount), notes: r.req_notes || '', ts: Number(r.req_ts) } : null });
-const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', common: !!r.common, ts: Number(r.ts) });
+const rowParty = (r) => ({ id: r.id, owner: r.owner, name: r.name, phone: r.phone, kind: r.kind, due: r.due || '', common: !!r.common, ts: Number(r.ts),
+  share: r.share_token ? { token: r.share_token, notes: !!r.share_notes, views: Number(r.share_views), seen: r.share_seen == null ? null : Number(r.share_seen) } : null });
 const rowAct = (r) => ({
   id: Number(r.id), ts: Number(r.ts), actor: r.actor, owner: r.owner, action: r.action, type: r.kind,
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
@@ -712,6 +718,41 @@ app.delete('/api/parties/:id', auth, wrap(async (req, res) => {
   if (used.rowCount) return res.status(409).json({ error: 'This party has entries. Delete those entries first.' });
   await pool.query('DELETE FROM parties WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
+}));
+
+// Customer khata link: a secret read-only link to one party's statement, opened without signing in.
+// The party's owner (or the admin, for a common party) turns it on, off, or replaces it.
+const newToken = () => crypto.randomBytes(12).toString('base64url');
+async function shareEdit(req, res, sql, params) {
+  const [w, a] = editable(req);
+  const { rows } = await pool.query('UPDATE parties SET ' + sql + ' WHERE id = $1 AND ' + w.replace('$X', '$' + (params.length + 2)) + ' RETURNING *', [req.params.id, ...params, ...a]);
+  if (!rows.length) return res.status(404).json({ error: 'Party not found' });
+  res.json(rowParty(rows[0]));
+}
+app.post('/api/parties/:id/share', auth, wrap((req, res) =>
+  shareEdit(req, res, 'share_token = COALESCE(share_token, $2), share_notes = $3', [newToken(), req.body.notes !== false])));
+app.post('/api/parties/:id/share/reset', auth, wrap((req, res) =>
+  shareEdit(req, res, 'share_token = $2, share_views = 0, share_seen = NULL', [newToken()])));
+app.put('/api/parties/:id/share', auth, wrap((req, res) => shareEdit(req, res, 'share_notes = $2', [req.body.notes !== false])));
+app.delete('/api/parties/:id/share', auth, wrap((req, res) =>
+  shareEdit(req, res, 'share_token = NULL, share_views = 0, share_seen = NULL', [])));
+// Public: only this party's entries, with no user names, ids or photos.
+app.get('/api/k/:token', wrap(async (req, res) => {
+  const t = String(req.params.token || '');
+  if (!/^[A-Za-z0-9_-]{16}$/.test(t)) return res.status(404).json({ error: 'This link is not valid or was turned off' });
+  const { rows } = await pool.query('UPDATE parties SET share_views = share_views + 1, share_seen = $2 WHERE share_token = $1 RETURNING *', [t, Date.now()]);
+  if (!rows.length) return res.status(404).json({ error: 'This link is not valid or was turned off' });
+  const p = rows[0];
+  const tx = p.common
+    ? await pool.query('SELECT * FROM tx WHERE party_id = $1 ORDER BY tx_date, tx_time, ts', [p.id])
+    : await pool.query('SELECT * FROM tx WHERE party_id = $1 AND username = $2 ORDER BY tx_date, tx_time, ts', [p.id, p.owner]);
+  const b = await bizInfo(true);
+  res.set('Cache-Control', 'no-store').json({
+    biz: { name: b.name, address: b.address, logo: b.logo },
+    party: { name: p.name, kind: p.kind, due: p.due || '' }, notes: !!p.share_notes,
+    entries: tx.rows.map((x) => ({ date: x.tx_date, type: x.kind, amount: Number(x.amount),
+      notes: p.share_notes ? x.notes : '', desc: p.share_notes ? x.descr : '' })),
+  });
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
