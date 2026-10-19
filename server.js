@@ -59,6 +59,14 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 INSERT INTO settings (id) VALUES (1) ON CONFLICT DO NOTHING;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS lock_days INT NOT NULL DEFAULT -1;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_to TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_from TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_summary BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_backup BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_last TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_err TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS cron_key TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS parties (
   id TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -753,6 +761,114 @@ app.get('/api/k/:token', wrap(async (req, res) => {
     entries: tx.rows.map((x) => ({ date: x.tx_date, type: x.kind, amount: Number(x.amount),
       notes: p.share_notes ? x.notes : '', desc: p.share_notes ? x.descr : '' })),
   });
+}));
+
+// ---- Email reports (Brevo): nightly summary and Excel backup to the admin ----
+// The Brevo API key comes from BREVO_API_KEY or is pasted by the admin in the app (stored here, never sent back).
+// Sleeping free servers have no reliable timer, so an outside scheduler (e.g. cron-job.org) opens
+// /api/cron/daily?key=<secret> each night; it sends at most once per India day unless forced.
+const ExcelJS = require('exceljs');
+const BREVO_URL = process.env.BREVO_URL || 'https://api.brevo.com/v3/smtp/email';
+const MON_S = MON;
+const fmtR = (n) => (n < 0 ? '−' : '') + '₹' + Math.abs(Number(n)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const dLabel = (d) => +d.slice(8) + ' ' + MON_S[+d.slice(5, 7) - 1] + ' ' + d.slice(0, 4);
+const escH = (x) => String(x == null ? '' : x).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+async function mailCfg() {
+  const r = (await pool.query('SELECT * FROM settings WHERE id = 1')).rows[0];
+  if (!r.cron_key) { r.cron_key = newToken() + newToken(); await pool.query('UPDATE settings SET cron_key = $1 WHERE id = 1', [r.cron_key]); }
+  return { ...r, key: process.env.BREVO_API_KEY || r.mail_key, keyFromEnv: !!process.env.BREVO_API_KEY };
+}
+async function sendMail(c, subject, html, attachments) {
+  if (!c.key) throw new Error('Add your Brevo API key first');
+  if (!c.mail_to) throw new Error('Enter the email address to send to');
+  const r = await fetch(BREVO_URL, { method: 'POST', headers: { 'api-key': c.key, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ sender: { name: c.name || 'Cashflow', email: c.mail_from || c.mail_to }, to: [{ email: c.mail_to }], subject, htmlContent: html,
+      ...(attachments && attachments.length ? { attachment: attachments } : {}) }) });
+  if (!r.ok) { let m = ''; try { m = (await r.json()).message || ''; } catch {} throw new Error('Brevo did not accept the email' + (m ? ': ' + m : ' (' + r.status + ')')); }
+}
+// Everything the summary and the backup need, worked out on the server.
+async function reportData() {
+  const today = istToday(), mo = today.slice(0, 7);
+  const [tx, parties, users, trs] = await Promise.all([
+    pool.query('SELECT * FROM tx ORDER BY tx_date, tx_time, ts'), pool.query('SELECT * FROM parties ORDER BY lower(name)'),
+    pool.query('SELECT username, role FROM users ORDER BY username'), pool.query("SELECT * FROM transfers WHERE status = 'pending' OR req_kind IS NOT NULL")]);
+  const r2 = (n) => Math.round(n * 100) / 100, sum = (f) => { let i = 0, o = 0, n = 0; tx.rows.forEach((t) => { if (!f(t)) return; n++; t.kind === 'in' ? i = r2(i + Number(t.amount)) : o = r2(o + Number(t.amount)); }); return { i, o, n }; };
+  const day = sum((t) => t.tx_date === today && !t.transfer_id), month = sum((t) => t.tx_date.startsWith(mo) && !t.transfer_id), all = sum(() => true);
+  const perUser = users.rows.filter((u) => u.role === 'user').map((u) => ({ name: u.username, today: sum((t) => t.username === u.username && t.tx_date === today), bal: (() => { const x = sum((t) => t.username === u.username); return r2(x.i - x.o); })() }));
+  const pbal = (p) => { let b = 0; tx.rows.forEach((t) => { if (t.party_id === p.id && (p.common || t.username === p.owner)) b = r2(b + (t.kind === 'out' ? 1 : -1) * Number(t.amount)); }); return b; };
+  const plist = parties.rows.map((p) => ({ p, bal: pbal(p) }));
+  const overdue = plist.filter((x) => x.p.due && x.bal > 0 && x.p.due < today).map((x) => ({ name: x.p.name, owner: x.p.common ? 'Common' : x.p.owner, bal: x.bal, due: x.p.due,
+    late: Math.round((Date.parse(today) - Date.parse(x.p.due)) / 864e5) })).sort((a, b) => b.late - a.late);
+  return { today, day, month, all, perUser, overdue, plist, tx: tx.rows, users: users.rows, parties: parties.rows, waiting: trs.rowCount };
+}
+function summaryHtml(c, d) {
+  const td = 'style="padding:6px 10px;border-bottom:1px solid #e5e7eb"', tr = (a, b) => `<tr><td ${td}>${a}</td><td ${td} align="right">${b}</td></tr>`;
+  let h = `<div style="font-family:Arial,sans-serif;max-width:560px;color:#1b1f24"><div style="background:#0f766e;color:#fff;padding:14px 16px;border-radius:10px 10px 0 0"><b style="font-size:18px">${escH(c.name || 'Cashflow')}</b><br><span style="opacity:.85">Daily summary · ${dLabel(d.today)}</span></div><div style="border:1px solid #e5e7eb;border-top:0;padding:14px 16px;border-radius:0 0 10px 10px">`;
+  h += `<h3 style="margin:0 0 6px">Today</h3><table style="border-collapse:collapse;width:100%">${tr('Cash in', `<b style="color:#047857">${fmtR(d.day.i)}</b>`)}${tr('Cash out', `<b style="color:#b91c1c">${fmtR(d.day.o)}</b>`)}${tr('Net', `<b>${fmtR(d.day.i - d.day.o)}</b>`)}${tr('Entries', d.day.n)}</table>`;
+  h += `<h3 style="margin:16px 0 6px">This month</h3><table style="border-collapse:collapse;width:100%">${tr('Cash in', fmtR(d.month.i))}${tr('Cash out', fmtR(d.month.o))}${tr('Net', fmtR(d.month.i - d.month.o))}</table>`;
+  h += `<h3 style="margin:16px 0 6px">Users</h3><table style="border-collapse:collapse;width:100%"><tr><th align="left" ${td}>User</th><th align="right" ${td}>Today in / out</th><th align="right" ${td}>Balance</th></tr>` +
+    d.perUser.map((u) => `<tr><td ${td}>${escH(u.name)}</td><td ${td} align="right">${fmtR(u.today.i)} / ${fmtR(u.today.o)}</td><td ${td} align="right"><b style="color:${u.bal < 0 ? '#b91c1c' : '#1b1f24'}">${fmtR(u.bal)}</b></td></tr>`).join('') + '</table>';
+  h += `<h3 style="margin:16px 0 6px">Overdue parties ${d.overdue.length ? '(' + d.overdue.length + ')' : ''}</h3>` + (d.overdue.length ? `<table style="border-collapse:collapse;width:100%">` +
+    d.overdue.map((o) => `<tr><td ${td}>${escH(o.name)} <span style="color:#6b7280">· ${escH(o.owner)}</span><br><small style="color:#b91c1c">due ${dLabel(o.due)} · ${o.late} days late</small></td><td ${td} align="right"><b style="color:#b91c1c">${fmtR(o.bal)}</b></td></tr>`).join('') + '</table>' : '<p style="color:#6b7280;margin:0">None 🎉</p>');
+  if (d.waiting) h += `<p style="margin:14px 0 0;color:#b45309">⏳ ${d.waiting} transfer${d.waiting === 1 ? '' : 's'} waiting for a user's OK.</p>`;
+  return h + `<p style="color:#6b7280;font-size:12px;margin:16px 0 0">Sent automatically by your Cashflow app.${c.mail_backup ? ' The full Excel backup is attached.' : ''}</p></div></div>`;
+}
+async function backupXlsx(c, d) {
+  const wb = new ExcelJS.Workbook(), money = '#,##0.00;-#,##0.00', pn = {}; d.parties.forEach((p) => { pn[p.id] = p.name; });
+  const sheet = (name, cols) => { const ws = wb.addWorksheet(name); ws.columns = cols.map(([header, key, width]) => ({ header, key, width })); const h = ws.getRow(1);
+    h.font = { bold: true, color: { argb: 'FFFFFFFF' } }; h.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F766E' } }; ws.views = [{ state: 'frozen', ySplit: 1 }]; return ws; };
+  const sm = sheet('Summary', [['Item', 'k', 28], ['Value', 'v', 40]]);
+  [['Business', c.name || ''], ['Backup date', dLabel(d.today)], ['Entries', d.tx.length], ['Total cash in', d.all.i], ['Total cash out', d.all.o], ['Balance', d.all.i - d.all.o], ['Parties', d.parties.length], ['Users', d.users.length]].forEach(([k, v]) => sm.addRow({ k, v }));
+  const es = sheet('Entries', [['Date', 'date', 12], ['Time', 'time', 8], ['User', 'user', 12], ['Type', 'type', 10], ['Cash in', 'in', 13], ['Cash out', 'out', 13], ['Notes', 'notes', 30], ['Description', 'desc', 24], ['Party', 'party', 20], ['Transfer', 'tr', 9]]);
+  d.tx.forEach((t) => es.addRow({ date: t.tx_date, time: t.tx_time, user: t.username, type: t.kind === 'in' ? 'Cash In' : 'Cash Out', in: t.kind === 'in' ? Number(t.amount) : null, out: t.kind === 'out' ? Number(t.amount) : null,
+    notes: t.notes, desc: t.descr, party: t.party_id ? pn[t.party_id] || '' : '', tr: t.transfer_id ? 'Yes' : '' }));
+  ['in', 'out'].forEach((k) => { es.getColumn(k).numFmt = money; });
+  const ps = sheet('Parties', [['Name', 'name', 22], ['Owner', 'owner', 12], ['Type', 'kind', 10], ['Phone', 'phone', 14], ['Due date', 'due', 12], ['Balance (they owe +)', 'bal', 18]]);
+  d.plist.forEach((x) => ps.addRow({ name: x.p.name, owner: x.p.common ? 'Common' : x.p.owner, kind: x.p.kind, phone: x.p.phone, due: x.p.due || '', bal: x.bal }));
+  ps.getColumn('bal').numFmt = money;
+  const us = sheet('Users', [['User', 'u', 14], ['Role', 'r', 8], ['Balance', 'b', 14]]);
+  d.users.forEach((u) => { const x = d.perUser.find((p) => p.name === u.username); us.addRow({ u: u.username, r: u.role, b: x ? x.bal : null }); });
+  us.getColumn('b').numFmt = money;
+  return Buffer.from(await wb.xlsx.writeBuffer()).toString('base64');
+}
+async function sendReport(c) {
+  const d = await reportData(), att = [];
+  if (c.mail_backup) att.push({ name: 'Cashflow backup ' + d.today + '.xlsx', content: await backupXlsx(c, d) });
+  await sendMail(c, (c.name || 'Cashflow') + ' · Daily summary · ' + dLabel(d.today), c.mail_summary ? summaryHtml(c, d) :
+    `<p>${escH(c.name || 'Cashflow')} backup for ${dLabel(d.today)} is attached.</p>`, att);
+  await pool.query("UPDATE settings SET mail_last = $1, mail_err = '' WHERE id = 1", [d.today + ' ' + new Date(Date.now() + 330 * 60000).toISOString().slice(11, 16)]);
+}
+const mailView = (c) => ({ to: c.mail_to, from: c.mail_from, summary: c.mail_summary, backup: c.mail_backup, hasKey: !!c.key, keyFromEnv: c.keyFromEnv,
+  keyHint: c.key ? '••••' + c.key.slice(-4) : '', last: c.mail_last, err: c.mail_err, cronPath: '/api/cron/daily?key=' + c.cron_key });
+const okEmail = (e) => e === '' || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+app.get('/api/mail', auth, adminOnly, wrap(async (req, res) => res.json(mailView(await mailCfg()))));
+app.put('/api/mail', auth, adminOnly, wrap(async (req, res) => {
+  const to = String(req.body.to || '').trim().slice(0, 200), from = String(req.body.from || '').trim().slice(0, 200);
+  if (!okEmail(to) || !okEmail(from)) return res.status(400).json({ error: 'Enter a valid email address' });
+  const key = req.body.key == null ? null : String(req.body.key).trim().slice(0, 300);
+  await pool.query('UPDATE settings SET mail_to = $1, mail_from = $2, mail_summary = $3, mail_backup = $4' + (key != null ? ', mail_key = $5' : '') + ' WHERE id = 1',
+    [to, from, req.body.summary !== false, req.body.backup !== false, ...(key != null ? [key] : [])]);
+  res.json(mailView(await mailCfg()));
+}));
+app.post('/api/mail/test', auth, adminOnly, wrap(async (req, res) => {
+  const c = await mailCfg();
+  try { await sendMail(c, (c.name || 'Cashflow') + ' · Test email', `<p style="font-family:Arial">✅ Email is working. Your daily summary and backup will arrive at this address.</p>`); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  res.json({ ok: true });
+}));
+app.post('/api/mail/send-now', auth, adminOnly, wrap(async (req, res) => {
+  const c = await mailCfg();
+  try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(400).json({ error: e.message }); }
+  res.json(mailView(await mailCfg()));
+}));
+// Opened by the outside scheduler. Sends at most once per India day; ?force=1 sends again.
+app.get('/api/cron/daily', wrap(async (req, res) => {
+  const c = await mailCfg();
+  if (!req.query.key || String(req.query.key) !== c.cron_key) return res.status(403).json({ error: 'Not allowed' });
+  if (!c.mail_to || (!c.mail_summary && !c.mail_backup)) return res.json({ ok: true, skipped: 'email reports are off' });
+  if (c.mail_last.startsWith(istToday()) && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
+  try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(502).json({ error: e.message }); }
+  res.json({ ok: true, sent: istToday() });
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
