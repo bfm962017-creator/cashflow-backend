@@ -250,13 +250,18 @@ async function atomic(fn) {
 // A real calendar date as YYYY-MM-DD (rejects impossible ones like 2026-02-31).
 const validDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s)) &&
   new Date(s + 'T00:00:00Z').toISOString().slice(0, 10) === s;
+// Work that may finish after the reply (push notifications), so saving never waits for the push services.
+// On Vercel, waitUntil keeps the function alive until it is done; elsewhere it simply runs on.
+let waitUntil = null;
+try { if (process.env.VERCEL) waitUntil = require('@vercel/functions').waitUntil; } catch (e) { /* not on Vercel */ }
+const later = (p) => { if (waitUntil) waitUntil(p); else p.catch(() => {}); };
 async function logAct(actor, owner, action, tx, prev) {
   try {
     await pool.query(
       'INSERT INTO activity (ts, actor, owner, action, kind, amount, prev_amount, notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [Date.now(), actor, owner, action, tx ? tx.kind : null, tx ? tx.amount : null, prev == null ? null : prev, tx ? (tx.notes || tx.descr || '') : '']);
   } catch (e) { console.error('activity log failed:', e.message); }
-  await pushActivity({ actor, owner, action, kind: tx ? tx.kind : null, amount: tx ? tx.amount : null, prev, notes: tx ? (tx.notes || tx.descr || '') : '' });
+  later(pushActivity({ actor, owner, action, kind: tx ? tx.kind : null, amount: tx ? tx.amount : null, prev, notes: tx ? (tx.notes || tx.descr || '') : '' }));
 }
 // ---- Push notifications (Web Push) ----
 // Each phone that turns them on stores a subscription here. A push goes to the people who would see
@@ -282,7 +287,7 @@ async function pushPrefs() {
   return { ...PUSH_DEFAULTS, ...(r && r.push_prefs ? r.push_prefs : {}) };
 }
 // Sends one message to each subscription; ones the push service says are gone are removed.
-// Everything finishes before the request replies, because on Vercel the server may pause right after.
+// Activity pushes run after the reply (see later()); the test and the daily reminders wait for them.
 async function sendPush(subs, make) {
   if (!subs.length) return 0;
   const k = await pushKeys(), subject = (ORIGINS[0] && /^https:/.test(ORIGINS[0])) ? ORIGINS[0] : 'mailto:noreply@cashflow.app';

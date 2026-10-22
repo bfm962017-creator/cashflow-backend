@@ -11,6 +11,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@vercel/functions": "^1.6.0",
     "bcryptjs": "^2.4.3",
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
