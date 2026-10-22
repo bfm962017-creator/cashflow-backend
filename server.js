@@ -11,12 +11,18 @@ const SECRET = process.env.JWT_SECRET;
 if (!DB_URL) { console.error('DATABASE_URL is required'); process.exit(1); }
 if (!SECRET) { console.error('JWT_SECRET is required'); process.exit(1); }
 
+// Hosted databases (Render's external address, Supabase, Neon) need SSL; a local or private one does not.
+// On Vercel each running copy of the server keeps only a couple of connections, so many copies
+// together stay inside the database pooler's limit.
 const pool = new Pool({
   connectionString: DB_URL,
-  ssl: /\.render\.com/.test(DB_URL) ? { rejectUnauthorized: false } : undefined,
+  ssl: /\.render\.com|supabase\.(co|com)|neon\.tech|sslmode=require/.test(DB_URL) ? { rejectUnauthorized: false } : undefined,
+  max: process.env.VERCEL ? 2 : 10,
+  idleTimeoutMillis: process.env.VERCEL ? 5000 : 10000,
 });
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS login_fails (k TEXT PRIMARY KEY, n INT NOT NULL, t BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
   username TEXT PRIMARY KEY,
   role TEXT NOT NULL CHECK (role IN ('admin','user')),
@@ -148,9 +154,16 @@ const jsonSmall = express.json({ limit: '50kb' }), jsonBig = express.json({ limi
 app.use((req, res, next) => (req.path === '/api/settings' || /^\/api\/tx\/[^/]+\/photo$/.test(req.path) ? jsonBig : jsonSmall)(req, res, next));
 // Every successful change bumps one revision number. Phones poll /api/rev (a few bytes) and only
 // download everything again when it moved, instead of pulling all entries every 20 seconds.
+// The bump happens before the reply goes out: on Vercel the server may be paused as soon as it has replied.
 app.use('/api', (req, res, next) => {
-  if (req.method !== 'GET' && req.method !== 'OPTIONS' && !/^\/(login|activity\/seen)$/.test(req.path))
-    res.on('finish', () => { if (res.statusCode < 400) pool.query('UPDATE meta SET rev = rev + 1 WHERE id = 1').catch(() => {}); });
+  if (req.method !== 'GET' && req.method !== 'OPTIONS' && !/^\/(login|activity\/seen)$/.test(req.path)) {
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      if (res.statusCode >= 400) return send(body);
+      pool.query('UPDATE meta SET rev = rev + 1 WHERE id = 1').catch(() => {}).then(() => send(body));
+      return res;
+    };
+  }
   next();
 });
 app.use((req, res, next) => {
@@ -219,16 +232,19 @@ async function logAct(actor, owner, action, tx, prev) {
 }
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 
-// simple login throttle: 8 failures / 15 min per ip+username
-const fails = new Map();
+// Login throttle: 8 failures / 15 min per ip+username. Kept in the database, because on Vercel
+// several copies of the server run side by side and none of them remembers anything between requests.
 const WINDOW = 15 * 60 * 1000;
-const limited = (k) => { const e = fails.get(k); return !!e && e.n >= 8 && Date.now() - e.t < WINDOW; };
-const addFail = (k) => {
-  const e = fails.get(k) || { n: 0, t: 0 };
-  if (Date.now() - e.t > WINDOW) e.n = 0;
-  e.n++; e.t = Date.now(); fails.set(k, e);
+const limited = async (k) => {
+  const r = (await pool.query('SELECT n, t FROM login_fails WHERE k = $1', [k])).rows[0];
+  return !!r && r.n >= 8 && Date.now() - Number(r.t) < WINDOW;
 };
-setInterval(() => { const n = Date.now(); for (const [k, v] of fails) if (n - v.t > WINDOW) fails.delete(k); }, 10 * 60 * 1000).unref();
+const addFail = async (k) => {
+  const now = Date.now();
+  await pool.query(`INSERT INTO login_fails (k, n, t) VALUES ($1, 1, $2) ON CONFLICT (k) DO UPDATE
+    SET n = CASE WHEN $2 - login_fails.t > ${WINDOW} THEN 1 ELSE login_fails.n + 1 END, t = $2`, [k, now]);
+  await pool.query('DELETE FROM login_fails WHERE t < $1', [now - WINDOW]);
+};
 
 const auth = wrap(async (req, res, next) => {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
@@ -268,11 +284,11 @@ app.post('/api/setup', wrap(async (req, res) => {
 
 app.post('/api/login', wrap(async (req, res) => {
   const u = uname(req.body.username), p = String(req.body.password || ''), key = req.ip + '|' + u;
-  if (limited(key)) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
+  if (await limited(key)) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
   const { rows } = await pool.query('SELECT username, pass_hash FROM users WHERE username = $1', [u]);
   const ok = await bcrypt.compare(p, rows.length ? rows[0].pass_hash : DUMMY_HASH);
-  if (!rows.length || !ok) { addFail(key); return res.status(401).json({ error: 'Wrong username or password' }); }
-  fails.delete(key);
+  if (!rows.length || !ok) { await addFail(key); return res.status(401).json({ error: 'Wrong username or password' }); }
+  await pool.query('DELETE FROM login_fails WHERE k = $1', [key]);
   res.json({ token: sign(u) });
 }));
 
@@ -864,7 +880,9 @@ app.post('/api/mail/send-now', auth, adminOnly, wrap(async (req, res) => {
 // Opened by the outside scheduler. Sends at most once per India day; ?force=1 sends again.
 app.get('/api/cron/daily', wrap(async (req, res) => {
   const c = await mailCfg();
-  if (!req.query.key || String(req.query.key) !== c.cron_key) return res.status(403).json({ error: 'Not allowed' });
+  // Opened by cron-job.org with ?key=, or by Vercel Cron, which sends "Authorization: Bearer <CRON_SECRET>".
+  const vercelCron = !!process.env.CRON_SECRET && req.headers.authorization === 'Bearer ' + process.env.CRON_SECRET;
+  if (!vercelCron && (!req.query.key || String(req.query.key) !== c.cron_key)) return res.status(403).json({ error: 'Not allowed' });
   if (!c.mail_to || (!c.mail_summary && !c.mail_backup)) return res.json({ ok: true, skipped: 'email reports are off' });
   if (c.mail_last.startsWith(istToday()) && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
   try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(502).json({ error: e.message }); }
@@ -909,18 +927,42 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
-(async () => {
-  for (let i = 1; ; i++) {
-    try { await pool.query(SCHEMA); break; }
-    catch (e) {
-      console.error('DB init failed (attempt ' + i + '):', e.message);
-      if (i >= 10) process.exit(1);
-      await new Promise((r) => setTimeout(r, 3000));
-    }
+// Database setup runs once per start of the server. It is skipped when the schema has not changed
+// since it last ran, so a fresh copy of the server on Vercel answers quickly.
+const SCHEMA_V = crypto.createHash('sha1').update(SCHEMA).digest('hex');
+async function initDb() {
+  let cur = null;
+  try { cur = (await pool.query('SELECT schema_v FROM meta WHERE id = 1')).rows[0].schema_v; } catch (e) { /* new database or older schema */ }
+  if (cur !== SCHEMA_V) {
+    await pool.query(SCHEMA);
+    await pool.query('ALTER TABLE meta ADD COLUMN IF NOT EXISTS schema_v TEXT');
+    await pool.query('UPDATE meta SET schema_v = $1 WHERE id = 1', [SCHEMA_V]);
   }
   // Drop photos of entries deleted more than 30 days ago (they can no longer be restored).
-  pool.query(`DELETE FROM tx_photos p WHERE NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = p.tx_id)
+  await pool.query(`DELETE FROM tx_photos p WHERE NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = p.tx_id)
     AND NOT EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = p.tx_id AND h.action = 'delete' AND h.ts > $1)`, [Date.now() - 30 * 86400000])
     .catch((e) => console.error('photo cleanup failed:', e.message));
-  app.listen(PORT, '0.0.0.0', () => console.log('Cashflow listening on ' + PORT));
-})();
+}
+let ready = null;
+const whenReady = () => ready || (ready = initDb().catch((e) => { ready = null; throw e; }));
+
+if (require.main === module) {
+  // Run as a normal server (Render, or locally): set up the database, retrying while it starts, then listen.
+  (async () => {
+    for (let i = 1; ; i++) {
+      try { await whenReady(); break; }
+      catch (e) {
+        console.error('DB init failed (attempt ' + i + '):', e.message);
+        if (i >= 10) process.exit(1);
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+    app.listen(PORT, '0.0.0.0', () => console.log('Cashflow listening on ' + PORT));
+  })();
+} else {
+  // Loaded by Vercel (api/index.js): every request waits until the database is set up.
+  module.exports = (req, res) => whenReady().then(() => app(req, res), (e) => {
+    console.error('DB init failed:', e.message);
+    res.statusCode = 503; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ error: 'Server is starting, try again' }));
+  });
+}
