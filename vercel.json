@@ -1,6 +1,26 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
-  "functions": { "api/index.js": { "maxDuration": 60 } },
-  "regions": ["bom1"],
-  "crons": [{ "path": "/api/cron/daily", "schedule": "30 17 * * *" }]
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  },
+  "regions": [
+    "bom1"
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily",
+      "schedule": "30 17 * * *"
+    },
+    {
+      "path": "/api/cron/remind",
+      "schedule": "30 14 * * *"
+    }
+  ]
 }
