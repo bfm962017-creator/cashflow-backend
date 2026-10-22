@@ -73,6 +73,19 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_backup BOOLEAN NOT NULL DEFAU
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_last TEXT NOT NULL DEFAULT '';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS mail_err TEXT NOT NULL DEFAULT '';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS cron_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS vapid_pub TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS vapid_priv TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS push_prefs JSONB;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS remind_last TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  lang TEXT NOT NULL DEFAULT 'en',
+  ts BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS push_subs_user_idx ON push_subs (username);
 CREATE TABLE IF NOT EXISTS parties (
   id TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -242,7 +255,118 @@ async function logAct(actor, owner, action, tx, prev) {
       'INSERT INTO activity (ts, actor, owner, action, kind, amount, prev_amount, notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [Date.now(), actor, owner, action, tx ? tx.kind : null, tx ? tx.amount : null, prev == null ? null : prev, tx ? (tx.notes || tx.descr || '') : '']);
   } catch (e) { console.error('activity log failed:', e.message); }
+  await pushActivity({ actor, owner, action, kind: tx ? tx.kind : null, amount: tx ? tx.amount : null, prev, notes: tx ? (tx.notes || tx.descr || '') : '' });
 }
+// ---- Push notifications (Web Push) ----
+// Each phone that turns them on stores a subscription here. A push goes to the people who would see
+// the activity under their bell: the user whose cashbook it is, and the admin (for the kinds the admin
+// chose in Push settings). The person who did it never gets their own push.
+// The VAPID key pair is made once and kept in settings, so nothing needs to be configured by hand.
+const webpush = require('web-push');
+const PUSH_DEFAULTS = { entries: true, changes: true, transfers: false, security: true, remind: true, overdue: true };
+let vapid = null;
+async function pushKeys() {
+  if (vapid) return vapid;
+  let r = (await pool.query('SELECT vapid_pub, vapid_priv FROM settings WHERE id = 1')).rows[0];
+  if (!r.vapid_pub) {
+    const k = webpush.generateVAPIDKeys();
+    await pool.query("UPDATE settings SET vapid_pub = $1, vapid_priv = $2 WHERE id = 1 AND vapid_pub = ''", [k.publicKey, k.privateKey]);
+    r = (await pool.query('SELECT vapid_pub, vapid_priv FROM settings WHERE id = 1')).rows[0];
+  }
+  vapid = { pub: r.vapid_pub, priv: r.vapid_priv };
+  return vapid;
+}
+async function pushPrefs() {
+  const r = (await pool.query('SELECT push_prefs FROM settings WHERE id = 1')).rows[0];
+  return { ...PUSH_DEFAULTS, ...(r && r.push_prefs ? r.push_prefs : {}) };
+}
+// Sends one message to each subscription; ones the push service says are gone are removed.
+// Everything finishes before the request replies, because on Vercel the server may pause right after.
+async function sendPush(subs, make) {
+  if (!subs.length) return 0;
+  const k = await pushKeys(), subject = (ORIGINS[0] && /^https:/.test(ORIGINS[0])) ? ORIGINS[0] : 'mailto:noreply@cashflow.app';
+  let sent = 0;
+  await Promise.allSettled(subs.map(async (s) => {
+    const msg = make(s.lang || 'en', s);
+    if (!msg) return;
+    try {
+      await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, JSON.stringify(msg),
+        { vapidDetails: { subject, publicKey: k.pub, privateKey: k.priv }, TTL: 12 * 3600, timeout: 4000, urgency: msg.urgent ? 'high' : 'normal' });
+      sent++;
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) await pool.query('DELETE FROM push_subs WHERE endpoint = $1', [s.endpoint]).catch(() => {});
+      else console.error('push failed:', e.statusCode || '', e.message);
+    }
+  }));
+  return sent;
+}
+// Push wording in the language the phone uses (English, Hindi or Hinglish).
+const PT = {
+  en: { in: 'Cash In', out: 'Cash Out', added: 'added', changed: 'changed', edited: 'edited', deleted: 'deleted', restored: 'restored',
+    sent: 'sent you', tap: 'tap to accept', accepted: 'accepted your transfer of', rejected: 'rejected your transfer of', cancelled: 'cancelled the transfer of',
+    askEdit: 'asks to change the transfer', askDel: 'asks to delete the transfer of', agreed: 'agreed to your request', refused: 'refused your request', withdrew: 'withdrew the request',
+    userAdd: 'New user added:', userDel: 'User removed:', userPw: 'Password changed for', settings: 'Business settings were changed', lockOff: 'Lock old entries turned off', lockOn: 'Lock old entries set to',
+    days: 'days', blocked: 'wrong passwords for', blocked2: 'login blocked for 15 minutes', noEntry: 'No entries today', noEntry2: 'You have not added any entries today. Add them before you forget.',
+    overdue: 'Overdue', late: 'days late', parties: 'parties' },
+  hi: { in: 'नकद आया', out: 'नकद गया', added: 'ने जोड़ा', changed: 'ने बदला', edited: 'ने बदला', deleted: 'ने हटाया', restored: 'ने वापस लाया',
+    sent: 'ने आपको भेजे', tap: 'स्वीकार करने के लिए टैप करें', accepted: 'ने आपका ट्रांसफ़र स्वीकार किया', rejected: 'ने आपका ट्रांसफ़र अस्वीकार किया', cancelled: 'ने ट्रांसफ़र रद्द किया',
+    askEdit: 'ट्रांसफ़र बदलना चाहते हैं', askDel: 'ट्रांसफ़र हटाना चाहते हैं', agreed: 'ने आपकी बात मान ली', refused: 'ने आपकी बात नहीं मानी', withdrew: 'ने अनुरोध वापस लिया',
+    userAdd: 'नया यूज़र जोड़ा गया:', userDel: 'यूज़र हटाया गया:', userPw: 'पासवर्ड बदला गया:', settings: 'बिज़नेस सेटिंग बदली गई', lockOff: 'पुरानी एंट्री लॉक बंद', lockOn: 'पुरानी एंट्री लॉक:',
+    days: 'दिन', blocked: 'गलत पासवर्ड:', blocked2: '15 मिनट के लिए लॉगिन बंद', noEntry: 'आज कोई एंट्री नहीं', noEntry2: 'आपने आज कोई एंट्री नहीं जोड़ी। भूलने से पहले जोड़ लें।',
+    overdue: 'बकाया', late: 'दिन लेट', parties: 'पार्टी' },
+  hg: { in: 'Paisa Aaya', out: 'Paisa Gaya', added: 'ne joda', changed: 'ne badla', edited: 'ne badla', deleted: 'ne delete kiya', restored: 'ne wapas laya',
+    sent: 'ne aapko bheje', tap: 'accept karne ke liye tap karein', accepted: 'ne aapka transfer accept kiya', rejected: 'ne aapka transfer reject kiya', cancelled: 'ne transfer cancel kiya',
+    askEdit: 'transfer badalna chahte hain', askDel: 'transfer delete karna chahte hain', agreed: 'ne aapki baat maan li', refused: 'ne aapki baat nahi maani', withdrew: 'ne request wapas li',
+    userAdd: 'Naya user joda:', userDel: 'User hataya:', userPw: 'Password badla:', settings: 'Business settings badli gayi', lockOff: 'Purani entry lock band', lockOn: 'Purani entry lock:',
+    days: 'din', blocked: 'galat password:', blocked2: '15 minute ke liye login band', noEntry: 'Aaj koi entry nahi', noEntry2: 'Aapne aaj koi entry nahi jodi. Bhoolne se pehle jod lein.',
+    overdue: 'Overdue', late: 'din late', parties: 'party' },
+};
+const pr = (n) => '₹' + Math.abs(Number(n)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+// Which admin switch an activity falls under (null: the admin is not sent it).
+const PUSH_CAT = { tx_add: 'entries', tx_edit: 'changes', tx_delete: 'changes', tx_restore: 'changes', tr_send: 'transfers', tr_accept: 'transfers', tr_reject: 'transfers',
+  tr_cancel: 'transfers', tr_req: 'transfers', tr_req_agree: 'transfers', tr_req_refuse: 'transfers', tr_req_withdraw: 'transfers',
+  user_add: 'security', user_delete: 'security', user_password: 'security', settings: 'security', lock: 'security', login_block: 'security' };
+function pushMsg(lang, a, forOwner) {
+  const t = PT[lang] || PT.en, k = a.kind === 'in' ? t.in : t.out, amt = a.amount == null ? '' : pr(a.amount), who = a.actor, note = a.notes ? ' · ' + a.notes : '';
+  // Hindi puts the verb after the name; English and Hinglish read "<name> <verb>".
+  const v = (verb, rest) => who + ' ' + verb + (rest ? ' ' + rest : '');
+  const own = forOwner || a.owner === a.actor ? '' : ' (' + a.owner + ')';
+  switch (a.action) {
+    case 'tx_add': return { body: v(t.added, k + ' ' + amt) + own + note, go: 'tx' };
+    case 'tx_edit': return { body: v(t.changed, (a.prev != null && Number(a.prev) !== Number(a.amount) ? pr(a.prev) + ' → ' : '') + amt) + own + note, go: 'tx' };
+    case 'tx_delete': return { body: v(t.deleted, k + ' ' + amt) + own + note, go: 'tx' };
+    case 'tx_restore': return { body: v(t.restored, k + ' ' + amt) + own + note, go: 'tx' };
+    case 'tr_send': return forOwner ? { body: v(t.sent, amt) + note + ' · ' + t.tap, go: 'transfer', urgent: true } : { body: who + ' → ' + a.owner + ' ' + amt + note, go: 'transfer' };
+    case 'tr_accept': return { body: v(t.accepted, amt) + (forOwner ? '' : own), go: 'transfer' };
+    case 'tr_reject': return { body: v(t.rejected, amt) + (forOwner ? '' : own), go: 'transfer' };
+    case 'tr_cancel': return { body: v(t.cancelled, amt) + (forOwner ? '' : own), go: 'transfer' };
+    case 'tr_req': return { body: who + ' ' + (a.kind === 'edit' ? t.askEdit + (a.prev != null ? ' ' + pr(a.prev) + ' → ' : ' ') + amt : t.askDel + ' ' + amt) + (forOwner ? '' : own), go: 'transfer', urgent: forOwner };
+    case 'tr_req_agree': return { body: v(t.agreed) + (forOwner ? '' : own), go: 'transfer' };
+    case 'tr_req_refuse': return { body: v(t.refused) + (forOwner ? '' : own), go: 'transfer' };
+    case 'tr_req_withdraw': return { body: v(t.withdrew) + (forOwner ? '' : own), go: 'transfer' };
+    case 'user_add': return { body: t.userAdd + ' ' + a.owner, go: 'bell' };
+    case 'user_delete': return { body: t.userDel + ' ' + a.owner, go: 'bell' };
+    case 'user_password': return { body: t.userPw + ' ' + a.owner, go: 'bell' };
+    case 'settings': return { body: t.settings + ' (' + who + ')', go: 'bell' };
+    case 'lock': return { body: Number(a.amount) < 0 ? t.lockOff : t.lockOn + ' ' + Number(a.amount) + ' ' + t.days, go: 'bell' };
+    case 'login_block': return { title: '⚠️ ' + (lang === 'en' ? 'Security' : lang === 'hi' ? 'सुरक्षा' : 'Security'), body: '8 ' + t.blocked + ' ' + a.owner + ' · ' + t.blocked2, go: 'bell', urgent: true };
+    default: return null;
+  }
+}
+async function pushActivity(a) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT s.*, u.role FROM push_subs s JOIN users u ON u.username = s.username WHERE s.username = $1 OR u.role = 'admin'`, [a.owner]);
+    if (!rows.length) return;
+    const prefs = await pushPrefs(), biz = (await pool.query('SELECT name FROM settings WHERE id = 1')).rows[0].name || 'Cashflow';
+    const subs = rows.filter((s) => s.username !== a.actor && (s.username === a.owner || (s.role === 'admin' && prefs[PUSH_CAT[a.action]])));
+    await sendPush(subs, (lang, s) => {
+      const m = pushMsg(lang, a, s.username === a.owner);
+      return m && { title: m.title || biz, body: m.body.slice(0, 240), go: m.go, urgent: !!m.urgent, tag: a.action.startsWith('tr_') ? 'tr' : undefined };
+    });
+  } catch (e) { console.error('push activity failed:', e.message); }
+}
+
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 
 // Login throttle: 8 failures / 15 min per ip+username. Kept in the database, because on Vercel
@@ -254,9 +378,10 @@ const limited = async (k) => {
 };
 const addFail = async (k) => {
   const now = Date.now();
-  await pool.query(`INSERT INTO login_fails (k, n, t) VALUES ($1, 1, $2) ON CONFLICT (k) DO UPDATE
-    SET n = CASE WHEN $2 - login_fails.t > ${WINDOW} THEN 1 ELSE login_fails.n + 1 END, t = $2`, [k, now]);
+  const r = await pool.query(`INSERT INTO login_fails (k, n, t) VALUES ($1, 1, $2) ON CONFLICT (k) DO UPDATE
+    SET n = CASE WHEN $2 - login_fails.t > ${WINDOW} THEN 1 ELSE login_fails.n + 1 END, t = $2 RETURNING n`, [k, now]);
   await pool.query('DELETE FROM login_fails WHERE t < $1', [now - WINDOW]);
+  return r.rows[0].n;
 };
 
 const auth = wrap(async (req, res, next) => {
@@ -300,7 +425,11 @@ app.post('/api/login', wrap(async (req, res) => {
   if (await limited(key)) return res.status(429).json({ error: 'Too many attempts. Try again in 15 minutes.' });
   const { rows } = await pool.query('SELECT username, pass_hash FROM users WHERE username = $1', [u]);
   const ok = await bcrypt.compare(p, rows.length ? rows[0].pass_hash : DUMMY_HASH);
-  if (!rows.length || !ok) { await addFail(key); return res.status(401).json({ error: 'Wrong username or password' }); }
+  if (!rows.length || !ok) {
+    // The 8th wrong password for an existing user locks the login and warns the admin (and the user).
+    if ((await addFail(key)) === 8 && rows.length) await logAct('system', u, 'login_block');
+    return res.status(401).json({ error: 'Wrong username or password' });
+  }
   await pool.query('DELETE FROM login_fails WHERE k = $1', [key]);
   res.json({ token: sign(u) });
 }));
@@ -900,6 +1029,70 @@ app.get('/api/cron/daily', wrap(async (req, res) => {
   if (c.mail_last.startsWith(istToday()) && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
   try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(502).json({ error: e.message }); }
   res.json({ ok: true, sent: istToday() });
+}));
+
+// ---- Push notification routes ----
+app.get('/api/push/key', auth, wrap(async (req, res) => res.json({ key: (await pushKeys()).pub })));
+app.post('/api/push/subscribe', auth, wrap(async (req, res) => {
+  const s = req.body.sub || {}, k = s.keys || {}, lang = ['en', 'hi', 'hg'].includes(req.body.lang) ? req.body.lang : 'en';
+  if (!/^https:\/\/[^\s]{10,900}$/.test(String(s.endpoint || '')) || !k.p256dh || !k.auth || String(k.p256dh).length > 200 || String(k.auth).length > 100)
+    return res.status(400).json({ error: 'Bad subscription' });
+  // One phone, one person: signing in as someone else on the same phone moves the subscription to them.
+  await pool.query(`INSERT INTO push_subs (endpoint, username, p256dh, auth, lang, ts) VALUES ($1,$2,$3,$4,$5,$6)
+    ON CONFLICT (endpoint) DO UPDATE SET username = $2, p256dh = $3, auth = $4, lang = $5, ts = $6`,
+    [s.endpoint, req.user.username, String(k.p256dh), String(k.auth), lang, Date.now()]);
+  res.json({ ok: true });
+}));
+app.post('/api/push/unsubscribe', auth, wrap(async (req, res) => {
+  await pool.query('DELETE FROM push_subs WHERE endpoint = $1 AND username = $2', [String(req.body.endpoint || ''), req.user.username]);
+  res.json({ ok: true });
+}));
+app.post('/api/push/test', auth, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM push_subs WHERE username = $1', [req.user.username]);
+  const n = await sendPush(rows, (lang) => ({ title: '🔔 Cashflow', body: lang === 'hi' ? 'नोटिफ़िकेशन चालू हैं ✓' : lang === 'hg' ? 'Notifications chalu hain ✓' : 'Notifications are on ✓', go: 'tx' }));
+  res.json({ sent: n, phones: rows.length });
+}));
+app.get('/api/push/prefs', auth, adminOnly, wrap(async (req, res) => res.json(await pushPrefs())));
+app.put('/api/push/prefs', auth, adminOnly, wrap(async (req, res) => {
+  const p = {};
+  Object.keys(PUSH_DEFAULTS).forEach((k) => { p[k] = req.body[k] === undefined ? undefined : !!req.body[k]; });
+  const cur = await pushPrefs(), next = {};
+  Object.keys(PUSH_DEFAULTS).forEach((k) => { next[k] = p[k] === undefined ? cur[k] : p[k]; });
+  await pool.query('UPDATE settings SET push_prefs = $1 WHERE id = 1', [next]);
+  res.json(next);
+}));
+// Daily reminders (Vercel Cron at 8 PM India time, or cron-job.org with ?key=): users who added nothing
+// today, and parties whose payment date has passed. Runs at most once per India day unless ?force=1.
+app.get('/api/cron/remind', wrap(async (req, res) => {
+  const c = await mailCfg();
+  const vercelCron = !!process.env.CRON_SECRET && req.headers.authorization === 'Bearer ' + process.env.CRON_SECRET;
+  if (!vercelCron && (!req.query.key || String(req.query.key) !== c.cron_key)) return res.status(403).json({ error: 'Not allowed' });
+  const today = istToday();
+  if (c.remind_last === today && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
+  await pool.query('UPDATE settings SET remind_last = $1 WHERE id = 1', [today]);
+  const prefs = await pushPrefs(), out = { ok: true, noEntry: 0, overdue: 0 };
+  if (prefs.remind) {
+    const { rows } = await pool.query(`SELECT s.* FROM push_subs s JOIN users u ON u.username = s.username
+      WHERE u.role = 'user' AND NOT EXISTS (SELECT 1 FROM tx WHERE tx.username = s.username AND tx.tx_date = $1)`, [today]);
+    out.noEntry = await sendPush(rows, (lang) => { const t = PT[lang] || PT.en; return { title: '📝 ' + t.noEntry, body: t.noEntry2, go: 'tx' }; });
+  }
+  if (prefs.overdue) {
+    const { rows: od } = await pool.query(`SELECT p.name, p.owner, p.due, SUM(CASE WHEN t.kind = 'out' THEN t.amount ELSE -t.amount END) AS bal
+      FROM parties p JOIN tx t ON t.party_id = p.id AND (p.common OR t.username = p.owner)
+      WHERE p.due <> '' AND p.due < $1 GROUP BY p.id HAVING SUM(CASE WHEN t.kind = 'out' THEN t.amount ELSE -t.amount END) > 0`, [today]);
+    const by = {};
+    od.forEach((p) => { (by[p.owner] = by[p.owner] || []).push({ name: p.name, bal: Number(p.bal), late: Math.round((Date.parse(today) - Date.parse(p.due)) / 864e5) }); });
+    const owners = Object.keys(by);
+    if (owners.length) {
+      const { rows: subs } = await pool.query('SELECT * FROM push_subs WHERE username = ANY($1)', [owners]);
+      out.overdue = await sendPush(subs, (lang, s) => {
+        const t = PT[lang] || PT.en, list = by[s.username].sort((a, b) => b.late - a.late), tot = list.reduce((x, p) => x + p.bal, 0);
+        return { title: '⏰ ' + t.overdue + ': ' + list.length + ' ' + (lang === 'en' && list.length === 1 ? 'party' : t.parties) + ' · ' + pr(tot),
+          body: list.slice(0, 4).map((p) => p.name + ' ' + pr(p.bal) + ' (' + p.late + ' ' + t.late + ')').join(', ') + (list.length > 4 ? ' …' : ''), go: 'ageing' };
+      });
+    }
+  }
+  res.json(out);
 }));
 
 app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
