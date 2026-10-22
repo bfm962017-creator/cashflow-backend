@@ -713,6 +713,17 @@ app.delete('/api/tx/:id/photo', auth, wrap(async (req, res) => {
 
 // Deleted entries (admin): deletions from the last 30 days that have not been restored.
 // Deleted entries (last 30 days): the admin sees all; a user sees only their own cashbook's.
+// User report (admin): how many entries in each user's book were edited or deleted between two times (ms).
+app.get('/api/report/changes', auth, adminOnly, wrap(async (req, res) => {
+  const from = Number(req.query.from), to = Number(req.query.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) return res.status(400).json({ error: 'Invalid date range' });
+  const { rows } = await pool.query(
+    `SELECT owner, action, COUNT(DISTINCT tx_id)::int AS n FROM tx_history
+     WHERE action IN ('edit','delete') AND ts >= $1 AND ts < $2 GROUP BY owner, action`, [from, to]);
+  const out = {};
+  rows.forEach((r) => { (out[r.owner] = out[r.owner] || { edit: 0, delete: 0 })[r.action] = r.n; });
+  res.json(out);
+}));
 app.get('/api/deleted', auth, wrap(async (req, res) => {
   const since = Date.now() - 30 * 86400000, admin = req.user.role === 'admin';
   const { rows } = await pool.query(
