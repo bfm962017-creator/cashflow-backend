@@ -130,6 +130,19 @@ CREATE TABLE IF NOT EXISTS tx_photos (
   bytes INT NOT NULL,
   ts BIGINT NOT NULL
 );
+-- Only this server reads the tables. On Supabase the public schema is also reachable through its
+-- web API with a public key, so row security is switched on (with no policies that means no access)
+-- and those web roles lose their rights. The server owns the tables, so this does not affect it.
+DO $$ DECLARE t text; BEGIN
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
+  END LOOP;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated';
+    EXECUTE 'REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated';
+  END IF;
+END $$;
 `;
 
 const ORIGINS = (process.env.FRONTEND_URL || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
