@@ -1086,6 +1086,7 @@ app.get('/api/cron/remind', wrap(async (req, res) => {
   const today = istToday();
   if (c.remind_last === today && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
   await pool.query('UPDATE settings SET remind_last = $1 WHERE id = 1', [today]);
+  await cleanPhotos();
   const prefs = await pushPrefs(), out = { ok: true, noEntry: 0, overdue: 0 };
   if (prefs.remind) {
     const { rows } = await pool.query(`SELECT s.* FROM push_subs s JOIN users u ON u.username = s.username
@@ -1172,16 +1173,24 @@ const SCHEMA_V = crypto.createHash('sha1').update(SCHEMA).digest('hex');
 async function initDb() {
   let cur = null;
   try { cur = (await pool.query('SELECT schema_v FROM meta WHERE id = 1')).rows[0].schema_v; } catch (e) { /* new database or older schema */ }
-  if (cur !== SCHEMA_V) {
-    await pool.query(SCHEMA);
-    await pool.query('ALTER TABLE meta ADD COLUMN IF NOT EXISTS schema_v TEXT');
-    await pool.query('UPDATE meta SET schema_v = $1 WHERE id = 1', [SCHEMA_V]);
-  }
-  // Drop photos of entries deleted more than 30 days ago (they can no longer be restored).
-  await pool.query(`DELETE FROM tx_photos p WHERE NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = p.tx_id)
-    AND NOT EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = p.tx_id AND h.action = 'delete' AND h.ts > $1)`, [Date.now() - 30 * 86400000])
-    .catch((e) => console.error('photo cleanup failed:', e.message));
+  if (cur === SCHEMA_V) return;
+  // Several copies of the server can start at once (Vercel). A transaction-scoped lock lets one of them
+  // set up the database while the others wait, then they see it is done (works through the pooler too).
+  await atomic(async (c) => {
+    await c.query('SELECT pg_advisory_xact_lock(727274)');
+    let v = null;
+    try { await c.query('SAVEPOINT s'); v = (await c.query('SELECT schema_v FROM meta WHERE id = 1')).rows[0].schema_v; }
+    catch (e) { await c.query('ROLLBACK TO SAVEPOINT s'); }
+    if (v === SCHEMA_V) return;
+    await c.query(SCHEMA);
+    await c.query('ALTER TABLE meta ADD COLUMN IF NOT EXISTS schema_v TEXT');
+    await c.query('UPDATE meta SET schema_v = $1 WHERE id = 1', [SCHEMA_V]);
+  });
 }
+// Photos of entries deleted more than 30 days ago can no longer be restored, so they are dropped (daily).
+const cleanPhotos = () => pool.query(`DELETE FROM tx_photos p WHERE NOT EXISTS (SELECT 1 FROM tx WHERE tx.id = p.tx_id)
+  AND NOT EXISTS (SELECT 1 FROM tx_history h WHERE h.tx_id = p.tx_id AND h.action = 'delete' AND h.ts > $1)`, [Date.now() - 30 * 86400000])
+  .catch((e) => console.error('photo cleanup failed:', e.message));
 let ready = null;
 const whenReady = () => ready || (ready = initDb().catch((e) => { ready = null; throw e; }));
 
