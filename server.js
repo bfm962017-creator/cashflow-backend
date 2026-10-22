@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS tx (
 CREATE INDEX IF NOT EXISTS tx_user_idx ON tx (username);
 CREATE INDEX IF NOT EXISTS tx_date_idx ON tx (tx_date);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tok_after BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS activity (
   id BIGSERIAL PRIMARY KEY,
   ts BIGINT NOT NULL,
@@ -390,8 +391,11 @@ const auth = wrap(async (req, res, next) => {
   let p;
   try { p = jwt.verify(m[1], SECRET, { algorithms: ['HS256'] }); }
   catch { return res.status(401).json({ error: 'Session expired' }); }
-  const { rows } = await pool.query('SELECT username, role, seen_at FROM users WHERE username = $1', [p.sub]);
+  const { rows } = await pool.query('SELECT username, role, seen_at, tok_after FROM users WHERE username = $1', [p.sub]);
   if (!rows.length) return res.status(401).json({ error: 'Account no longer exists' });
+  // tok_after (seconds) moves forward when the password changes or the account is created again,
+  // so sign-ins from before that stop working.
+  if (!(p.iat >= Number(rows[0].tok_after))) return res.status(401).json({ error: 'Please sign in again' });
   req.user = rows[0];
   next();
 });
@@ -719,6 +723,7 @@ app.post('/api/deleted/:id/restore', auth, wrap(async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM tx_history WHERE id = $1 AND action = 'delete'", [req.params.id]);
   if (!rows.length || (req.user.role !== 'admin' && rows[0].owner !== req.user.username)) return res.status(404).json({ error: 'Not found' });
   const s = rows[0].snapshot, c = await lockCutoff(req);
+  if (s.transfer_id && req.user.role !== 'admin') return res.status(403).json({ error: 'Only the admin can restore a transfer' });
   if (c && s.tx_date < c) return locked(res, c);
   const pty = s.party_id && (await partyOk(s.party_id, s.username)) ? s.party_id : null;
   const back = await atomic(async (c) => {
@@ -774,7 +779,13 @@ async function decide(req, res, who, status, fn) {
     const t = rows[0];
     if (!t || t[who] !== req.user.username) { await c.query('ROLLBACK'); return res.status(404).json({ error: 'Transfer not found' }); }
     if (t.status !== 'pending') { await c.query('ROLLBACK'); return res.status(409).json({ error: 'This transfer was already ' + t.status }); }
-    const made = fn ? await fn(c, t) : [];
+    let made = [];
+    try { made = fn ? await fn(c, t) : []; }
+    catch (e) {
+      if (e.message !== 'LOCKED') throw e;
+      await c.query('ROLLBACK');
+      return res.status(403).json({ error: 'This transfer is dated ' + +t.tx_date.slice(8) + ' ' + MON[+t.tx_date.slice(5, 7) - 1] + ', before the lock date. Ask ' + t.from_user + ' to cancel it and send it again with a newer date.' });
+    }
     for (const m of made) await logHist(m, req.user.username, 'add', null, c);
     const u = await c.query('UPDATE transfers SET status = $2, done_ts = $3 WHERE id = $1 RETURNING *', [t.id, status, Date.now()]);
     await c.query('COMMIT');
@@ -785,7 +796,10 @@ async function decide(req, res, who, status, fn) {
 }
 app.post('/api/transfers/:id/accept', auth, noAdmin(TRANSFER_USERS), wrap(async (req, res) => {
   const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(req.body.time || '') ? req.body.time : '';
+  const cut = await lockCutoff(req);
   await decide(req, res, 'to_user', 'accepted', async (c, t) => {
+    // The lock may have moved past the transfer's date while it was waiting.
+    if (cut && t.tx_date < cut) { const e = new Error('LOCKED'); e.cut = cut; throw e; }
     const ins = (user, kind, notes) => c.query(
       'INSERT INTO tx (id, username, kind, amount, tx_date, tx_time, notes, descr, ts, transfer_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
       [crypto.randomUUID(), user, kind, t.amount, t.tx_date, time, notes, t.notes, Date.now(), t.id]);
@@ -834,6 +848,8 @@ app.post('/api/transfers/:id/request/:answer', auth, noAdmin(TRANSFER_USERS), wr
   const clear = () => c.query('UPDATE transfers SET req_kind = NULL, req_by = NULL, req_amount = NULL, req_notes = NULL, req_ts = NULL WHERE id = $1 RETURNING *', [t.id]);
   const info = { kind: t.req_kind, amount: t.req_kind === 'edit' ? t.req_amount : t.amount, notes: t.notes };
   if (a !== 'agree') return { t: (await clear()).rows[0], act: { owner: other, action: a === 'refuse' ? 'tr_req_refuse' : 'tr_req_withdraw', row: info } };
+  const cut = await lockCutoff(req);
+  if (cut && t.tx_date < cut) return { code: 403, error: 'Locked: entries before ' + +cut.slice(8) + ' ' + MON[+cut.slice(5, 7) - 1] + ' ' + cut.slice(0, 4) + ' can only be changed by the admin' };
   const acts = [{ owner: t.req_by, action: 'tr_req_agree', row: info }];
   if (t.req_kind === 'edit') await changeTransfer(c, t.id, req.user.username, Number(t.req_amount), t.req_notes || '');
   else await removeTransfer(c, t.id, req.user.username);
@@ -1099,9 +1115,14 @@ app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
   const u = uname(req.body.username), p = String(req.body.password || '');
   if (!u) return res.status(400).json({ error: 'Enter a username' });
   if (p.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  // A deleted user's entries stay in the books under their name; a new person must not take them over.
+  const used = await pool.query(`SELECT 1 FROM tx WHERE username = $1 UNION ALL SELECT 1 FROM parties WHERE owner = $1
+    UNION ALL SELECT 1 FROM transfers WHERE from_user = $1 OR to_user = $1 UNION ALL SELECT 1 FROM tx_history WHERE owner = $1 LIMIT 1`, [u]);
+  const taken = (await pool.query('SELECT 1 FROM users WHERE username = $1', [u])).rowCount > 0;
+  if (!taken && used.rowCount) return res.status(409).json({ error: 'This username was used before and its entries are still in the books. Choose another name.' });
   const hash = await bcrypt.hash(p, 10);
   const r = await pool.query(
-    "INSERT INTO users (username, role, pass_hash) VALUES ($1,'user',$2) ON CONFLICT DO NOTHING RETURNING username", [u, hash]);
+    "INSERT INTO users (username, role, pass_hash, tok_after) VALUES ($1,'user',$2,$3) ON CONFLICT DO NOTHING RETURNING username", [u, hash, Math.floor(Date.now() / 1000)]);
   if (!r.rowCount) return res.status(409).json({ error: 'Username already exists' });
   await logAct(req.user.username, u, 'user_add');
   res.json({ ok: true });
@@ -1110,17 +1131,29 @@ app.post('/api/users', auth, adminOnly, wrap(async (req, res) => {
 app.put('/api/users/:name/password', auth, adminOnly, wrap(async (req, res) => {
   const p = String(req.body.password || '');
   if (p.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  const r = await pool.query('UPDATE users SET pass_hash = $2 WHERE username = $1',
-    [uname(req.params.name), await bcrypt.hash(p, 10)]);
+  // Changing a password signs that person out everywhere. If admins change their own, they get a fresh session.
+  const name = uname(req.params.name), now = Math.floor(Date.now() / 1000);
+  const r = await pool.query('UPDATE users SET pass_hash = $2, tok_after = $3 WHERE username = $1', [name, await bcrypt.hash(p, 10), now]);
   if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
-  await logAct(req.user.username, uname(req.params.name), 'user_password');
-  res.json({ ok: true });
+  await logAct(req.user.username, name, 'user_password');
+  res.json(name === req.user.username ? { ok: true, token: sign(name) } : { ok: true });
 }));
 
 app.delete('/api/users/:name', auth, adminOnly, wrap(async (req, res) => {
-  const r = await pool.query("DELETE FROM users WHERE username = $1 AND role <> 'admin'", [uname(req.params.name)]);
+  // Their entries stay. Customer links to their parties stop working, transfers still waiting on them
+  // are cancelled, open change requests are cleared, and their phones stop getting notifications.
+  const name = uname(req.params.name);
+  const r = await atomic(async (c) => {
+    const d = await c.query("DELETE FROM users WHERE username = $1 AND role <> 'admin'", [name]);
+    if (!d.rowCount) return d;
+    await c.query('UPDATE parties SET share_token = NULL WHERE owner = $1 AND NOT common', [name]);
+    await c.query("UPDATE transfers SET status = 'cancelled', done_ts = $2 WHERE status = 'pending' AND (from_user = $1 OR to_user = $1)", [name, Date.now()]);
+    await c.query('UPDATE transfers SET req_kind = NULL, req_by = NULL, req_amount = NULL, req_notes = NULL, req_ts = NULL WHERE req_kind IS NOT NULL AND (from_user = $1 OR to_user = $1)', [name]);
+    await c.query('DELETE FROM push_subs WHERE username = $1', [name]);
+    return d;
+  });
   if (!r.rowCount) return res.status(404).json({ error: 'User not found (admin cannot be deleted)' });
-  await logAct(req.user.username, uname(req.params.name), 'user_delete');
+  await logAct(req.user.username, name, 'user_delete');
   res.json({ ok: true });
 }));
 
