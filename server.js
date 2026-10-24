@@ -1151,6 +1151,19 @@ app.put('/api/drive', auth, adminOnly, wrap(async (req, res) => {
   const url = String(req.body.url || '').trim(), keep = Number(req.body.keep);
   if (url && !DRIVE_URL_RE.test(url)) return res.status(400).json({ error: 'This is not a Google Apps Script Web app link. It starts with https://script.google.com/macros/s/ and ends with /exec' });
   if (!DRIVE_KEEP.includes(keep)) return res.status(400).json({ error: 'Choose how long to keep backups' });
+  // Once connected, the link and how long backups are kept change only with the admin's password,
+  // so a slip of the finger cannot stop the backups or delete old ones.
+  const c = await driveCfg();
+  if (c.drive_url && (url !== c.drive_url || keep !== c.drive_keep)) {
+    const k = 'pw|' + req.user.username;
+    if (await limited(k)) return res.status(429).json({ error: 'Too many wrong passwords. Try again in 15 minutes.' });
+    const h = (await pool.query('SELECT pass_hash FROM users WHERE username = $1', [req.user.username])).rows[0];
+    if (!req.body.password || !h || !(await bcrypt.compare(String(req.body.password), h.pass_hash))) {
+      await addFail(k);
+      return res.status(403).json({ error: req.body.password ? 'Wrong password' : 'Enter your password to change this' });
+    }
+    await pool.query('DELETE FROM login_fails WHERE k = $1', [k]);
+  }
   await pool.query("UPDATE settings SET drive_url = $1, drive_keep = $2, drive_err = CASE WHEN drive_url = $1 THEN drive_err ELSE '' END WHERE id = 1", [url, keep]);
   res.json(await driveView(await driveCfg()));
 }));
