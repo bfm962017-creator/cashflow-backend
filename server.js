@@ -666,6 +666,41 @@ app.delete('/api/tx/:id', auth, wrap(async (req, res) => {
 }));
 
 // History of one entry: its owner and the admin can read it. Works for deleted entries too.
+// Exception centre (admin): everything worth a second look in a period, newest first. Entry edits,
+// deletes and restores come from tx_history (with what changed); entries dated more than 2 days before
+// they were added count as back-dated; transfer disputes and security events come from activity.
+const EXC_ACT = ['tr_cancel', 'tr_reject', 'tr_req', 'tr_req_agree', 'tr_req_refuse', 'tr_req_withdraw',
+  'user_add', 'user_delete', 'user_password', 'user_rename', 'login_block', 'drive_fail', 'lock', 'settings'];
+const istMs = (d) => Date.parse(d + 'T00:00:00+05:30');
+app.get('/api/exceptions', auth, adminOnly, wrap(async (req, res) => {
+  const from = String(req.query.from || ''), to = String(req.query.to || ''), user = req.query.user ? String(req.query.user) : null;
+  if (!validDate(from) || !validDate(to) || from > to) return res.status(400).json({ error: 'Invalid date range' });
+  const a = istMs(from), b = istMs(to) + 864e5, P = user ? [a, b, user] : [a, b], U = (o, x) => user ? ` AND (${o} = $3 OR ${x} = $3)` : '';
+  const [hist, back, acts] = await Promise.all([
+    pool.query(`SELECT h.*, t.kind t_kind, t.amount t_amount, t.tx_date t_date, t.notes t_notes, t.party_id t_party, t.transfer_id t_tr,
+        (SELECT s.snapshot FROM tx_history s WHERE s.tx_id = h.tx_id AND s.snapshot IS NOT NULL ORDER BY s.ts DESC LIMIT 1) last_snap
+      FROM tx_history h LEFT JOIN tx t ON t.id = h.tx_id
+      WHERE h.action IN ('edit','delete','restore') AND h.ts >= $1 AND h.ts < $2${U('h.owner', 'h.actor')} ORDER BY h.ts DESC LIMIT 1000`, P),
+    pool.query(`SELECT h.*, t.id t_id FROM tx_history h LEFT JOIN tx t ON t.id = h.tx_id
+      WHERE h.action = 'add' AND h.ts >= $1 AND h.ts < $2 AND h.snapshot->>'transfer_id' IS NULL
+        AND h.snapshot->>'tx_date' < to_char((to_timestamp(h.ts / 1000.0) AT TIME ZONE 'Asia/Kolkata') - interval '2 days', 'YYYY-MM-DD')${U('h.owner', 'h.actor')}
+      ORDER BY h.ts DESC LIMIT 1000`, P),
+    pool.query(`SELECT * FROM activity WHERE action = ANY($${user ? 4 : 3}) AND ts >= $1 AND ts < $2${U('owner', 'actor')} ORDER BY ts DESC LIMIT 1000`, [...P, EXC_ACT])]);
+  const txOf = (h) => {
+    const s = h.snapshot || h.last_snap || {}, live = h.t_kind != null;
+    return { id: h.tx_id, live, type: live ? h.t_kind : s.kind, amount: live ? Number(h.t_amount) : Number(s.amount),
+      date: live ? h.t_date : s.tx_date, notes: live ? h.t_notes : s.notes, party: live ? h.t_party : s.party_id, transfer: !!(live ? h.t_tr : s.transfer_id) };
+  };
+  const items = [];
+  hist.rows.forEach((h) => items.push({ ts: Number(h.ts), kind: h.action, actor: h.actor, owner: h.owner, tx: txOf(h), changes: h.changes }));
+  back.rows.forEach((h) => { const s = h.snapshot; items.push({ ts: Number(h.ts), kind: 'backdated', actor: h.actor, owner: h.owner,
+    tx: { id: h.tx_id, live: !!h.t_id, type: s.kind, amount: Number(s.amount), date: s.tx_date, notes: s.notes, party: s.party_id } }); });
+  acts.rows.forEach((r) => items.push({ ts: Number(r.ts), kind: r.action, actor: r.actor, owner: r.owner,
+    act: { type: r.kind, amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes } }));
+  items.sort((x, y) => y.ts - x.ts);
+  res.json({ items: items.slice(0, 1500), more: items.length > 1500 });
+}));
+
 app.get('/api/tx/:id/history', auth, wrap(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM tx_history WHERE tx_id = $1 ORDER BY ts DESC, id DESC', [req.params.id]);
   const cur = await pool.query('SELECT username FROM tx WHERE id = $1', [req.params.id]);
