@@ -44,6 +44,7 @@ CREATE INDEX IF NOT EXISTS tx_user_idx ON tx (username);
 CREATE INDEX IF NOT EXISTS tx_date_idx ON tx (tx_date);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_at BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tok_after BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS activity (
   id BIGSERIAL PRIMARY KEY,
   ts BIGINT NOT NULL,
@@ -219,7 +220,7 @@ const rowAct = (r) => ({
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: lock | tr_req | tr_req_agree | tr_req_refuse | tr_req_withdraw | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | settings | tr_send | tr_accept | tr_reject | tr_cancel
+// action: lock | tr_req | tr_req_agree | tr_req_refuse | tr_req_withdraw | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | user_rename | settings | tr_send | tr_accept | tr_reject | tr_cancel
 // Entry history: every add / edit / delete / restore is stored with who, when and what changed.
 // Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
 const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
@@ -311,19 +312,19 @@ const PT = {
   en: { in: 'Cash In', out: 'Cash Out', added: 'added', changed: 'changed', edited: 'edited', deleted: 'deleted', restored: 'restored',
     sent: 'sent you', tap: 'tap to accept', accepted: 'accepted your transfer of', rejected: 'rejected your transfer of', cancelled: 'cancelled the transfer of',
     askEdit: 'asks to change the transfer', askDel: 'asks to delete the transfer of', agreed: 'agreed to your request', refused: 'refused your request', withdrew: 'withdrew the request',
-    userAdd: 'New user added:', userDel: 'User removed:', userPw: 'Password changed for', settings: 'Business settings were changed', lockOff: 'Lock old entries turned off', lockOn: 'Lock old entries set to',
+    userAdd: 'New user added:', userDel: 'User removed:', userPw: 'Password changed for', userRen: 'Username changed:', settings: 'Business settings were changed', lockOff: 'Lock old entries turned off', lockOn: 'Lock old entries set to',
     days: 'days', blocked: 'wrong passwords for', blocked2: 'login blocked for 15 minutes', noEntry: 'No entries today', noEntry2: 'You have not added any entries today. Add them before you forget.',
     overdue: 'Overdue', late: 'days late', parties: 'parties' },
   hi: { in: 'नकद आया', out: 'नकद गया', added: 'ने जोड़ा', changed: 'ने बदला', edited: 'ने बदला', deleted: 'ने हटाया', restored: 'ने वापस लाया',
     sent: 'ने आपको भेजे', tap: 'स्वीकार करने के लिए टैप करें', accepted: 'ने आपका ट्रांसफ़र स्वीकार किया', rejected: 'ने आपका ट्रांसफ़र अस्वीकार किया', cancelled: 'ने ट्रांसफ़र रद्द किया',
     askEdit: 'ट्रांसफ़र बदलना चाहते हैं', askDel: 'ट्रांसफ़र हटाना चाहते हैं', agreed: 'ने आपकी बात मान ली', refused: 'ने आपकी बात नहीं मानी', withdrew: 'ने अनुरोध वापस लिया',
-    userAdd: 'नया यूज़र जोड़ा गया:', userDel: 'यूज़र हटाया गया:', userPw: 'पासवर्ड बदला गया:', settings: 'बिज़नेस सेटिंग बदली गई', lockOff: 'पुरानी एंट्री लॉक बंद', lockOn: 'पुरानी एंट्री लॉक:',
+    userAdd: 'नया यूज़र जोड़ा गया:', userDel: 'यूज़र हटाया गया:', userPw: 'पासवर्ड बदला गया:', userRen: 'यूज़रनेम बदला गया:', settings: 'बिज़नेस सेटिंग बदली गई', lockOff: 'पुरानी एंट्री लॉक बंद', lockOn: 'पुरानी एंट्री लॉक:',
     days: 'दिन', blocked: 'गलत पासवर्ड:', blocked2: '15 मिनट के लिए लॉगिन बंद', noEntry: 'आज कोई एंट्री नहीं', noEntry2: 'आपने आज कोई एंट्री नहीं जोड़ी। भूलने से पहले जोड़ लें।',
     overdue: 'बकाया', late: 'दिन लेट', parties: 'पार्टी' },
   hg: { in: 'Paisa Aaya', out: 'Paisa Gaya', added: 'ne joda', changed: 'ne badla', edited: 'ne badla', deleted: 'ne delete kiya', restored: 'ne wapas laya',
     sent: 'ne aapko bheje', tap: 'accept karne ke liye tap karein', accepted: 'ne aapka transfer accept kiya', rejected: 'ne aapka transfer reject kiya', cancelled: 'ne transfer cancel kiya',
     askEdit: 'transfer badalna chahte hain', askDel: 'transfer delete karna chahte hain', agreed: 'ne aapki baat maan li', refused: 'ne aapki baat nahi maani', withdrew: 'ne request wapas li',
-    userAdd: 'Naya user joda:', userDel: 'User hataya:', userPw: 'Password badla:', settings: 'Business settings badli gayi', lockOff: 'Purani entry lock band', lockOn: 'Purani entry lock:',
+    userAdd: 'Naya user joda:', userDel: 'User hataya:', userPw: 'Password badla:', userRen: 'Username badla:', settings: 'Business settings badli gayi', lockOff: 'Purani entry lock band', lockOn: 'Purani entry lock:',
     days: 'din', blocked: 'galat password:', blocked2: '15 minute ke liye login band', noEntry: 'Aaj koi entry nahi', noEntry2: 'Aapne aaj koi entry nahi jodi. Bhoolne se pehle jod lein.',
     overdue: 'Overdue', late: 'din late', parties: 'party' },
 };
@@ -331,7 +332,7 @@ const pr = (n) => '₹' + Math.abs(Number(n)).toLocaleString('en-IN', { maximumF
 // Which admin switch an activity falls under (null: the admin is not sent it).
 const PUSH_CAT = { tx_add: 'entries', tx_edit: 'changes', tx_delete: 'changes', tx_restore: 'changes', tr_send: 'transfers', tr_accept: 'transfers', tr_reject: 'transfers',
   tr_cancel: 'transfers', tr_req: 'transfers', tr_req_agree: 'transfers', tr_req_refuse: 'transfers', tr_req_withdraw: 'transfers',
-  user_add: 'security', user_delete: 'security', user_password: 'security', settings: 'security', lock: 'security', login_block: 'security' };
+  user_add: 'security', user_delete: 'security', user_password: 'security', user_rename: 'security', settings: 'security', lock: 'security', login_block: 'security' };
 function pushMsg(lang, a, forOwner) {
   const t = PT[lang] || PT.en, k = a.kind === 'in' ? t.in : t.out, amt = a.amount == null ? '' : pr(a.amount), who = a.actor, note = a.notes ? ' · ' + a.notes : '';
   // Hindi puts the verb after the name; English and Hinglish read "<name> <verb>".
@@ -353,6 +354,7 @@ function pushMsg(lang, a, forOwner) {
     case 'user_add': return { body: t.userAdd + ' ' + a.owner, go: 'bell' };
     case 'user_delete': return { body: t.userDel + ' ' + a.owner, go: 'bell' };
     case 'user_password': return { body: t.userPw + ' ' + a.owner, go: 'bell' };
+    case 'user_rename': return { body: t.userRen + ' ' + a.notes + ' → ' + a.owner, go: 'bell' };
     case 'settings': return { body: t.settings + ' (' + who + ')', go: 'bell' };
     case 'lock': return { body: Number(a.amount) < 0 ? t.lockOff : t.lockOn + ' ' + Number(a.amount) + ' ' + t.days, go: 'bell' };
     case 'login_block': return { title: '⚠️ ' + (lang === 'en' ? 'Security' : lang === 'hi' ? 'सुरक्षा' : 'Security'), body: '8 ' + t.blocked + ' ' + a.owner + ' · ' + t.blocked2, go: 'bell', urgent: true };
@@ -396,7 +398,7 @@ const auth = wrap(async (req, res, next) => {
   let p;
   try { p = jwt.verify(m[1], SECRET, { algorithms: ['HS256'] }); }
   catch { return res.status(401).json({ error: 'Session expired' }); }
-  const { rows } = await pool.query('SELECT username, role, seen_at, tok_after FROM users WHERE username = $1', [p.sub]);
+  const { rows } = await pool.query('SELECT username, role, seen_at, tok_after, full_name FROM users WHERE username = $1', [p.sub]);
   if (!rows.length) return res.status(401).json({ error: 'Account no longer exists' });
   // tok_after (seconds) moves forward when the password changes or the account is created again,
   // so sign-ins from before that stop working.
@@ -452,10 +454,10 @@ app.get('/api/data', auth, wrap(async (req, res) => {
     : await pool.query(TX_SELECT + ' WHERE username = $1 ORDER BY tx_date, tx_time, ts', [req.user.username]);
   const users = {};
   if (admin) {
-    (await pool.query('SELECT username, role FROM users ORDER BY username')).rows
-      .forEach((r) => { users[r.username] = { name: r.username, role: r.role }; });
+    (await pool.query('SELECT username, role, full_name FROM users ORDER BY username')).rows
+      .forEach((r) => { users[r.username] = { name: r.username, role: r.role, full: r.full_name }; });
   } else {
-    users[req.user.username] = { name: req.user.username, role: req.user.role };
+    users[req.user.username] = { name: req.user.username, role: req.user.role, full: req.user.full_name };
   }
   const a = admin
     ? await pool.query('SELECT * FROM activity ORDER BY ts DESC LIMIT 100')
@@ -1154,6 +1156,51 @@ app.put('/api/users/:name/password', auth, adminOnly, wrap(async (req, res) => {
   if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
   await logAct(req.user.username, name, 'user_password');
   res.json(name === req.user.username ? { ok: true, token: sign(name) } : { ok: true });
+}));
+
+// Edit a user (admin): display name, username and, optionally, a new password, all in one go.
+// A new username is written into every record that names the user (entries, parties, transfers,
+// history, notifications), so their books stay exactly the same. They have to sign in again with it.
+const RENAME = [['tx', 'username'], ['parties', 'owner'], ['transfers', 'from_user'], ['transfers', 'to_user'], ['transfers', 'req_by'],
+  ['activity', 'actor'], ['activity', 'owner'], ['tx_history', 'owner'], ['tx_history', 'actor'], ['push_subs', 'username']];
+async function renameRefs(c, from, to) {
+  for (const [t, col] of RENAME) await c.query(`UPDATE ${t} SET ${col} = $2 WHERE ${col} = $1`, [from, to]);
+  // Transfer entries carry the other person's name in their notes ("⇄ To shams").
+  await c.query("UPDATE tx SET notes = '⇄ To ' || $2 WHERE transfer_id IS NOT NULL AND notes = '⇄ To ' || $1", [from, to]);
+  await c.query("UPDATE tx SET notes = '⇄ From ' || $2 WHERE transfer_id IS NOT NULL AND notes = '⇄ From ' || $1", [from, to]);
+  await c.query("UPDATE tx_history SET snapshot = jsonb_set(snapshot, '{username}', to_jsonb($2::text)) WHERE snapshot->>'username' = $1", [from, to]);
+}
+app.put('/api/users/:name', auth, adminOnly, wrap(async (req, res) => {
+  const name = uname(req.params.name), b = req.body || {};
+  const to = b.username === undefined ? name : uname(b.username), full = String(b.full_name == null ? '' : b.full_name).trim().replace(/\s+/g, ' ').slice(0, 60);
+  const p = b.password ? String(b.password) : '';
+  if (!to) return res.status(400).json({ error: 'Enter a username' });
+  if (to.length > 32) return res.status(400).json({ error: 'Username is too long (max 32 characters)' });
+  if (p && p.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const now = Math.floor(Date.now() / 1000), hash = p ? await bcrypt.hash(p, 10) : null;
+  const r = await atomic(async (c) => {
+    const cur = await c.query('SELECT username FROM users WHERE username = $1 FOR UPDATE', [name]);
+    if (!cur.rowCount) return { code: 404, error: 'User not found' };
+    if (to !== name) {
+      if ((await c.query('SELECT 1 FROM users WHERE username = $1', [to])).rowCount) return { code: 409, error: 'Username already exists' };
+      const used = await c.query(`SELECT 1 FROM tx WHERE username = $1 UNION ALL SELECT 1 FROM parties WHERE owner = $1
+        UNION ALL SELECT 1 FROM transfers WHERE from_user = $1 OR to_user = $1 UNION ALL SELECT 1 FROM tx_history WHERE owner = $1 LIMIT 1`, [to]);
+      if (used.rowCount) return { code: 409, error: 'This username was used before and its entries are still in the books. Choose another name.' };
+      await c.query('UPDATE users SET username = $2, tok_after = $3 WHERE username = $1', [name, to, now]);
+      await renameRefs(c, name, to);
+    }
+    await c.query('UPDATE users SET full_name = $2' + (hash ? ', pass_hash = $3, tok_after = $4' : '') + ' WHERE username = $1',
+      hash ? [to, full, hash, now] : [to, full]);
+    return { ok: true };
+  });
+  if (r.code) return res.status(r.code).json({ error: r.error });
+  if (to !== name) {
+    // Something the old name saved in the moment before the change (it is signed out now) is moved over too.
+    try { await atomic((c) => renameRefs(c, name, to)); } catch (e) { console.error('rename follow-up failed:', e.message); }
+    await logAct(req.user.username, to, 'user_rename', { kind: null, amount: null, notes: name });
+  }
+  if (hash) await logAct(req.user.username, to, 'user_password');
+  res.json(name === req.user.username && (to !== name || hash) ? { ok: true, token: sign(to) } : { ok: true });
 }));
 
 app.delete('/api/users/:name', auth, adminOnly, wrap(async (req, res) => {
