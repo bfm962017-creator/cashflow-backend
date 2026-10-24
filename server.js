@@ -45,6 +45,12 @@ CREATE INDEX IF NOT EXISTS tx_date_idx ON tx (tx_date);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_at BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tok_after BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_secret TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_keep INT NOT NULL DEFAULT 90;
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_last TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_err TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS drive_log (id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, ok BOOLEAN NOT NULL, bytes INT NOT NULL DEFAULT 0, msg TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS activity (
   id BIGSERIAL PRIMARY KEY,
   ts BIGINT NOT NULL,
@@ -220,7 +226,7 @@ const rowAct = (r) => ({
   amount: r.amount == null ? null : Number(r.amount), prev: r.prev_amount == null ? null : Number(r.prev_amount), notes: r.notes,
 });
 // Records who did what for the notification feed. A failed write never fails the request itself.
-// action: lock | tr_req | tr_req_agree | tr_req_refuse | tr_req_withdraw | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | user_rename | settings | tr_send | tr_accept | tr_reject | tr_cancel
+// action: lock | tr_req | tr_req_agree | tr_req_refuse | tr_req_withdraw | tx_add | tx_edit | tx_delete | tx_restore | user_add | user_delete | user_password | user_rename | drive_fail | settings | tr_send | tr_accept | tr_reject | tr_cancel
 // Entry history: every add / edit / delete / restore is stored with who, when and what changed.
 // Edits keep only the fields that changed ({field: [old, new]}); add/delete keep the whole row.
 const HIST_FIELDS = ['kind', 'amount', 'tx_date', 'tx_time', 'notes', 'descr', 'party_id'];
@@ -312,19 +318,19 @@ const PT = {
   en: { in: 'Cash In', out: 'Cash Out', added: 'added', changed: 'changed', edited: 'edited', deleted: 'deleted', restored: 'restored',
     sent: 'sent you', tap: 'tap to accept', accepted: 'accepted your transfer of', rejected: 'rejected your transfer of', cancelled: 'cancelled the transfer of',
     askEdit: 'asks to change the transfer', askDel: 'asks to delete the transfer of', agreed: 'agreed to your request', refused: 'refused your request', withdrew: 'withdrew the request',
-    userAdd: 'New user added:', userDel: 'User removed:', userPw: 'Password changed for', userRen: 'Username changed:', settings: 'Business settings were changed', lockOff: 'Lock old entries turned off', lockOn: 'Lock old entries set to',
+    userAdd: 'New user added:', userDel: 'User removed:', userPw: 'Password changed for', userRen: 'Username changed:', driveFail: 'Google Drive backup failed:', settings: 'Business settings were changed', lockOff: 'Lock old entries turned off', lockOn: 'Lock old entries set to',
     days: 'days', blocked: 'wrong passwords for', blocked2: 'login blocked for 15 minutes', noEntry: 'No entries today', noEntry2: 'You have not added any entries today. Add them before you forget.',
     overdue: 'Overdue', late: 'days late', parties: 'parties' },
   hi: { in: 'नकद आया', out: 'नकद गया', added: 'ने जोड़ा', changed: 'ने बदला', edited: 'ने बदला', deleted: 'ने हटाया', restored: 'ने वापस लाया',
     sent: 'ने आपको भेजे', tap: 'स्वीकार करने के लिए टैप करें', accepted: 'ने आपका ट्रांसफ़र स्वीकार किया', rejected: 'ने आपका ट्रांसफ़र अस्वीकार किया', cancelled: 'ने ट्रांसफ़र रद्द किया',
     askEdit: 'ट्रांसफ़र बदलना चाहते हैं', askDel: 'ट्रांसफ़र हटाना चाहते हैं', agreed: 'ने आपकी बात मान ली', refused: 'ने आपकी बात नहीं मानी', withdrew: 'ने अनुरोध वापस लिया',
-    userAdd: 'नया यूज़र जोड़ा गया:', userDel: 'यूज़र हटाया गया:', userPw: 'पासवर्ड बदला गया:', userRen: 'यूज़रनेम बदला गया:', settings: 'बिज़नेस सेटिंग बदली गई', lockOff: 'पुरानी एंट्री लॉक बंद', lockOn: 'पुरानी एंट्री लॉक:',
+    userAdd: 'नया यूज़र जोड़ा गया:', userDel: 'यूज़र हटाया गया:', userPw: 'पासवर्ड बदला गया:', userRen: 'यूज़रनेम बदला गया:', driveFail: 'Google Drive बैकअप नहीं हुआ:', settings: 'बिज़नेस सेटिंग बदली गई', lockOff: 'पुरानी एंट्री लॉक बंद', lockOn: 'पुरानी एंट्री लॉक:',
     days: 'दिन', blocked: 'गलत पासवर्ड:', blocked2: '15 मिनट के लिए लॉगिन बंद', noEntry: 'आज कोई एंट्री नहीं', noEntry2: 'आपने आज कोई एंट्री नहीं जोड़ी। भूलने से पहले जोड़ लें।',
     overdue: 'बकाया', late: 'दिन लेट', parties: 'पार्टी' },
   hg: { in: 'Paisa Aaya', out: 'Paisa Gaya', added: 'ne joda', changed: 'ne badla', edited: 'ne badla', deleted: 'ne delete kiya', restored: 'ne wapas laya',
     sent: 'ne aapko bheje', tap: 'accept karne ke liye tap karein', accepted: 'ne aapka transfer accept kiya', rejected: 'ne aapka transfer reject kiya', cancelled: 'ne transfer cancel kiya',
     askEdit: 'transfer badalna chahte hain', askDel: 'transfer delete karna chahte hain', agreed: 'ne aapki baat maan li', refused: 'ne aapki baat nahi maani', withdrew: 'ne request wapas li',
-    userAdd: 'Naya user joda:', userDel: 'User hataya:', userPw: 'Password badla:', userRen: 'Username badla:', settings: 'Business settings badli gayi', lockOff: 'Purani entry lock band', lockOn: 'Purani entry lock:',
+    userAdd: 'Naya user joda:', userDel: 'User hataya:', userPw: 'Password badla:', userRen: 'Username badla:', driveFail: 'Google Drive backup nahi hua:', settings: 'Business settings badli gayi', lockOff: 'Purani entry lock band', lockOn: 'Purani entry lock:',
     days: 'din', blocked: 'galat password:', blocked2: '15 minute ke liye login band', noEntry: 'Aaj koi entry nahi', noEntry2: 'Aapne aaj koi entry nahi jodi. Bhoolne se pehle jod lein.',
     overdue: 'Overdue', late: 'din late', parties: 'party' },
 };
@@ -332,7 +338,7 @@ const pr = (n) => '₹' + Math.abs(Number(n)).toLocaleString('en-IN', { maximumF
 // Which admin switch an activity falls under (null: the admin is not sent it).
 const PUSH_CAT = { tx_add: 'entries', tx_edit: 'changes', tx_delete: 'changes', tx_restore: 'changes', tr_send: 'transfers', tr_accept: 'transfers', tr_reject: 'transfers',
   tr_cancel: 'transfers', tr_req: 'transfers', tr_req_agree: 'transfers', tr_req_refuse: 'transfers', tr_req_withdraw: 'transfers',
-  user_add: 'security', user_delete: 'security', user_password: 'security', user_rename: 'security', settings: 'security', lock: 'security', login_block: 'security' };
+  user_add: 'security', user_delete: 'security', user_password: 'security', user_rename: 'security', drive_fail: 'security', settings: 'security', lock: 'security', login_block: 'security' };
 function pushMsg(lang, a, forOwner) {
   const t = PT[lang] || PT.en, k = a.kind === 'in' ? t.in : t.out, amt = a.amount == null ? '' : pr(a.amount), who = a.actor, note = a.notes ? ' · ' + a.notes : '';
   // Hindi puts the verb after the name; English and Hinglish read "<name> <verb>".
@@ -355,6 +361,7 @@ function pushMsg(lang, a, forOwner) {
     case 'user_delete': return { body: t.userDel + ' ' + a.owner, go: 'bell' };
     case 'user_password': return { body: t.userPw + ' ' + a.owner, go: 'bell' };
     case 'user_rename': return { body: t.userRen + ' ' + a.notes + ' → ' + a.owner, go: 'bell' };
+    case 'drive_fail': return { title: '☁️ Google Drive', body: t.driveFail + ' ' + a.notes, go: 'bell', urgent: true };
     case 'settings': return { body: t.settings + ' (' + who + ')', go: 'bell' };
     case 'lock': return { body: Number(a.amount) < 0 ? t.lockOff : t.lockOn + ' ' + Number(a.amount) + ' ' + t.days, go: 'bell' };
     case 'login_block': return { title: '⚠️ ' + (lang === 'en' ? 'Security' : lang === 'hi' ? 'सुरक्षा' : 'Security'), body: '8 ' + t.blocked + ' ' + a.owner + ' · ' + t.blocked2, go: 'bell', urgent: true };
@@ -1053,16 +1060,133 @@ app.post('/api/mail/send-now', auth, adminOnly, wrap(async (req, res) => {
   try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(400).json({ error: e.message }); }
   res.json(mailView(await mailCfg()));
 }));
-// Opened by the outside scheduler. Sends at most once per India day; ?force=1 sends again.
-app.get('/api/cron/daily', wrap(async (req, res) => {
+// ---- Google Drive backup ----
+// The admin deploys a small Google Apps Script (web app) in their own Google account; each night the
+// server posts the Excel backup to it and the script saves it in a "Cashflow Backups" folder in their
+// Drive, deleting files older than the chosen number of days. The script only accepts our secret.
+const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const DRIVE_URL_RE = /^https:\/\/script\.google\.com\/(a\/[\w.-]+\/)?macros\/s\/[\w-]{20,200}\/exec$/;
+const DRIVE_KEEP = [0, 30, 60, 90, 180, 365];
+async function driveCfg() {
   const c = await mailCfg();
+  if (!c.drive_secret) { c.drive_secret = newToken() + newToken(); await pool.query('UPDATE settings SET drive_secret = $1 WHERE id = 1', [c.drive_secret]); }
+  return c;
+}
+const driveScript = (secret) => `// Cashflow → Google Drive backup.
+// Paste this into a new project at script.google.com, then Deploy → New deployment → Web app
+// (Execute as: Me, Who has access: Anyone) and copy the Web app link into the Cashflow app.
+const SECRET = '${secret}';
+const FOLDER = 'Cashflow Backups';
+
+function doGet() {
+  return out({ ok: true, app: 'cashflow-drive' });
+}
+
+function doPost(e) {
+  let b;
+  try { b = JSON.parse(e.postData.contents); } catch (x) { return out({ ok: false, error: 'Bad request' }); }
+  if (b.secret !== SECRET) return out({ ok: false, error: 'Wrong secret' });
+  const it = DriveApp.getFoldersByName(FOLDER), folder = it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER);
+  // A second backup on the same day replaces the first one.
+  const same = folder.getFilesByName(b.name);
+  while (same.hasNext()) same.next().setTrashed(true);
+  const file = folder.createFile(Utilities.newBlob(Utilities.base64Decode(b.data), b.type, b.name));
+  let removed = 0;
+  const keep = Number(b.keep) || 0;
+  if (keep > 0) {
+    const cut = Date.now() - keep * 86400000, all = folder.getFiles();
+    while (all.hasNext()) { const f = all.next(); if (f.getDateCreated().getTime() < cut) { f.setTrashed(true); removed++; } }
+  }
+  return out({ ok: true, size: file.getSize(), removed: removed, folder: folder.getUrl() });
+}
+
+function out(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+`;
+async function driveSend(c) {
+  const d = await reportData(), data = await backupXlsx(c, d), name = 'Cashflow backup ' + d.today + '.xlsx';
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 45000);
+  let j;
+  try {
+    const r = await fetch(c.drive_url, { method: 'POST', headers: { 'content-type': 'text/plain' }, redirect: 'follow', signal: ctl.signal,
+      body: JSON.stringify({ secret: c.drive_secret, name, type: XLSX_TYPE, data, keep: c.drive_keep }) });
+    const txt = await r.text();
+    try { j = JSON.parse(txt); } catch (e) {
+      throw new Error(r.ok ? 'Google did not answer as expected. Deploy the script as a Web app with access "Anyone".' : 'Google answered with error ' + r.status + '. Check the Drive link.');
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Google Drive took too long to answer. Try again.');
+    if (e.message && e.message.startsWith('fetch failed')) throw new Error('Could not reach Google Drive. Check the Drive link.');
+    throw e;
+  } finally { clearTimeout(timer); }
+  if (!j.ok) throw new Error(j.error === 'Wrong secret' ? 'The script in Google has an old secret. Copy the script again, paste it and deploy a new version.' : j.error || 'Google Drive did not save the file');
+  return { name, size: Number(j.size) || Math.round(data.length * 3 / 4), removed: Number(j.removed) || 0, folder: j.folder || '' };
+}
+// Runs one backup and records how it went. Returns the error message, or '' when it worked.
+async function driveRun(c) {
+  const now = Date.now(), stamp = istToday() + ' ' + new Date(now + 330 * 60000).toISOString().slice(11, 16);
+  try {
+    const r = await driveSend(c);
+    await pool.query("UPDATE settings SET drive_last = $1, drive_err = '' WHERE id = 1", [stamp]);
+    await pool.query('INSERT INTO drive_log (ts, ok, bytes, msg) VALUES ($1, true, $2, $3)', [now, r.size, r.folder]);
+    return '';
+  } catch (e) {
+    const m = String(e.message || e).slice(0, 300);
+    await pool.query('UPDATE settings SET drive_err = $1 WHERE id = 1', [m]);
+    await pool.query('INSERT INTO drive_log (ts, ok, msg) VALUES ($1, false, $2)', [now, m]);
+    return m;
+  } finally {
+    await pool.query('DELETE FROM drive_log WHERE id NOT IN (SELECT id FROM drive_log ORDER BY ts DESC LIMIT 30)');
+  }
+}
+async function driveView(c) {
+  const log = (await pool.query('SELECT ts, ok, bytes, msg FROM drive_log ORDER BY ts DESC LIMIT 10')).rows;
+  const lastOk = log.find((x) => x.ok);
+  return { url: c.drive_url, keep: c.drive_keep, last: c.drive_last, err: c.drive_err, script: driveScript(c.drive_secret),
+    folder: lastOk ? lastOk.msg : '', log: log.map((x) => ({ ts: Number(x.ts), ok: x.ok, bytes: x.bytes, msg: x.ok ? '' : x.msg })) };
+}
+app.get('/api/drive', auth, adminOnly, wrap(async (req, res) => res.json(await driveView(await driveCfg()))));
+app.put('/api/drive', auth, adminOnly, wrap(async (req, res) => {
+  const url = String(req.body.url || '').trim(), keep = Number(req.body.keep);
+  if (url && !DRIVE_URL_RE.test(url)) return res.status(400).json({ error: 'This is not a Google Apps Script Web app link. It starts with https://script.google.com/macros/s/ and ends with /exec' });
+  if (!DRIVE_KEEP.includes(keep)) return res.status(400).json({ error: 'Choose how long to keep backups' });
+  await pool.query("UPDATE settings SET drive_url = $1, drive_keep = $2, drive_err = CASE WHEN drive_url = $1 THEN drive_err ELSE '' END WHERE id = 1", [url, keep]);
+  res.json(await driveView(await driveCfg()));
+}));
+app.post('/api/drive/run', auth, adminOnly, wrap(async (req, res) => {
+  const c = await driveCfg();
+  if (!c.drive_url) return res.status(400).json({ error: 'Paste your Drive link first' });
+  const e = await driveRun(c);
+  if (e) return res.status(400).json({ error: e });
+  res.json(await driveView(await driveCfg()));
+}));
+
+// Opened every night by Vercel Cron (or cron-job.org with ?key=). Sends the email report and the Drive
+// backup, each at most once per India day; ?force=1 sends again.
+app.get('/api/cron/daily', wrap(async (req, res) => {
+  const c = await driveCfg();
   // Opened by cron-job.org with ?key=, or by Vercel Cron, which sends "Authorization: Bearer <CRON_SECRET>".
   const vercelCron = !!process.env.CRON_SECRET && req.headers.authorization === 'Bearer ' + process.env.CRON_SECRET;
   if (!vercelCron && (!req.query.key || String(req.query.key) !== c.cron_key)) return res.status(403).json({ error: 'Not allowed' });
-  if (!c.mail_to || (!c.mail_summary && !c.mail_backup)) return res.json({ ok: true, skipped: 'email reports are off' });
-  if (c.mail_last.startsWith(istToday()) && !req.query.force) return res.json({ ok: true, skipped: 'already sent today' });
-  try { await sendReport(c); } catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); return res.status(502).json({ error: e.message }); }
-  res.json({ ok: true, sent: istToday() });
+  const today = istToday(), force = !!req.query.force, out = { ok: true };
+  if (!c.mail_to || (!c.mail_summary && !c.mail_backup)) out.mail = 'off';
+  else if (c.mail_last.startsWith(today) && !force) out.mail = 'already sent today';
+  else {
+    try { await sendReport(c); out.mail = 'sent'; }
+    catch (e) { await pool.query('UPDATE settings SET mail_err = $1 WHERE id = 1', [e.message.slice(0, 300)]); out.mail = 'failed: ' + e.message; }
+  }
+  if (!c.drive_url) out.drive = 'off';
+  else if (c.drive_last.startsWith(today) && !force) out.drive = 'already done today';
+  else {
+    const e = await driveRun(c);
+    out.drive = e ? 'failed: ' + e : 'saved';
+    if (e) {
+      const a = (await pool.query("SELECT username FROM users WHERE role = 'admin' ORDER BY username LIMIT 1")).rows[0];
+      if (a) await logAct('system', a.username, 'drive_fail', { kind: null, amount: null, notes: e });
+    }
+  }
+  res.json(out);
 }));
 
 // ---- Push notification routes ----
