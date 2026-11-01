@@ -50,6 +50,10 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_secret TEXT NOT NULL DEFAULT
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_keep INT NOT NULL DEFAULT 90;
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_last TEXT NOT NULL DEFAULT '';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_err TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_model TEXT NOT NULL DEFAULT 'gemini-2.5-flash';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_limit INT NOT NULL DEFAULT 50;
+CREATE TABLE IF NOT EXISTS ai_usage (day TEXT NOT NULL, username TEXT NOT NULL, n INT NOT NULL DEFAULT 0, PRIMARY KEY (day, username));
 CREATE TABLE IF NOT EXISTS drive_log (id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, ok BOOLEAN NOT NULL, bytes INT NOT NULL DEFAULT 0, msg TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS activity (
   id BIGSERIAL PRIMARY KEY,
@@ -1235,6 +1239,244 @@ app.get('/api/cron/daily', wrap(async (req, res) => {
     }
   }
   res.json(out);
+}));
+
+// ---- Ask Khata: a chat assistant on Google Gemini ----
+// Gemini never sees the database. It can only call the tools below; the server runs each one with the
+// asking person's permissions (a user sees their own entries and parties, the admin everything) and
+// sends back a small result. It cannot change anything: draft_entry only proposes an entry, which the
+// person saves from the app with the normal entry checks. The key is pasted by the admin (or set in
+// GEMINI_API_KEY) and never sent back to the app.
+const GEMINI_URL = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com/v1beta/models/';
+const AI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
+async function aiCfg() {
+  const r = (await pool.query('SELECT ai_key, ai_model, ai_limit FROM settings WHERE id = 1')).rows[0];
+  return { key: process.env.GEMINI_API_KEY || r.ai_key, fromEnv: !!process.env.GEMINI_API_KEY, model: r.ai_model, limit: r.ai_limit };
+}
+const aiView = (c) => ({ hasKey: !!c.key, keyFromEnv: c.fromEnv, keyHint: c.key ? '••••' + c.key.slice(-4) : '', model: c.model, limit: c.limit, models: AI_MODELS });
+const AI_TOOLS = [
+  { name: 'get_summary', description: 'Cash in, cash out, net and number of entries for a date range. Transfers between users are listed separately. For the admin, by_user gives the same per user.',
+    parameters: { type: 'OBJECT', properties: { from: { type: 'STRING', description: 'YYYY-MM-DD' }, to: { type: 'STRING', description: 'YYYY-MM-DD' }, user: { type: 'STRING', description: 'Admin only: one username' } }, required: ['from', 'to'] } },
+  { name: 'find_parties', description: 'Parties (customers, suppliers, staff) with their balance. balance > 0 means the party owes us (we will get), < 0 means we owe them (we will give). Without a name, returns the biggest balances first.',
+    parameters: { type: 'OBJECT', properties: { name: { type: 'STRING', description: 'Part of the party name, any spelling' }, sort: { type: 'STRING', enum: ['they_owe_most', 'we_owe_most', 'overdue'] } } } },
+  { name: 'party_details', description: 'One party: balance, phone, due date, last payment, unpaid amounts by age (0-30, 31-60, 60+ days) and the latest entries.',
+    parameters: { type: 'OBJECT', properties: { name: { type: 'STRING', description: 'Party name or part of it' } }, required: ['name'] } },
+  { name: 'search_entries', description: 'Find entries. All filters are optional. Returns up to 25 matching entries (newest first) and the count and totals of all matches.',
+    parameters: { type: 'OBJECT', properties: { text: { type: 'STRING', description: 'Words in notes, description or party name, e.g. fuel, petrol, rent' }, type: { type: 'STRING', enum: ['in', 'out'] },
+      min_amount: { type: 'NUMBER' }, max_amount: { type: 'NUMBER' }, from: { type: 'STRING', description: 'YYYY-MM-DD' }, to: { type: 'STRING', description: 'YYYY-MM-DD' },
+      party: { type: 'STRING', description: 'Party name' }, user: { type: 'STRING', description: 'Admin only: username' } } } },
+  { name: 'cash_in_hand', description: 'Current cash in hand (all-time balance) of the person asking, or for the admin of every user.',
+    parameters: { type: 'OBJECT', properties: { user: { type: 'STRING', description: 'Admin only: one username' } } } },
+  { name: 'recent_changes', description: 'Admin only. Entries edited, deleted or back-dated (dated more than 2 days before they were added) in a date range, with counts per user and the latest examples.',
+    parameters: { type: 'OBJECT', properties: { from: { type: 'STRING' }, to: { type: 'STRING' }, user: { type: 'STRING' } }, required: ['from', 'to'] } },
+  { name: 'draft_entry', description: 'Prepare a new cash entry for the person to check and save in the app. It is NOT saved. Use when the person asks to add or record money in or out. Users only; the admin does not add entries.',
+    parameters: { type: 'OBJECT', properties: { type: { type: 'STRING', enum: ['in', 'out'], description: 'in = money received, out = money paid' }, amount: { type: 'NUMBER' },
+      notes: { type: 'STRING', description: 'Short note, e.g. Petrol' }, date: { type: 'STRING', description: 'YYYY-MM-DD, default today' }, party: { type: 'STRING', description: 'Party name if mentioned' } }, required: ['type', 'amount'] } },
+];
+const r2 = (n) => Math.round(n * 100) / 100;
+const okDate = (d, def) => (validDate(String(d || '')) ? String(d) : def);
+// What one person may see: entries (own, or all for the admin) and parties (own + common, or all).
+async function aiScope(u) {
+  const admin = u.role === 'admin';
+  const [tx, parties] = await Promise.all([
+    admin ? pool.query('SELECT * FROM tx ORDER BY tx_date, tx_time, ts') : pool.query('SELECT * FROM tx WHERE username = $1 ORDER BY tx_date, tx_time, ts', [u.username]),
+    admin ? pool.query('SELECT * FROM parties') : pool.query('SELECT * FROM parties WHERE owner = $1 OR common', [u.username])]);
+  // A common party's balance counts every user's lines, as on its party page.
+  const common = parties.rows.filter((p) => p.common).map((p) => p.id);
+  const ctx = !admin && common.length ? (await pool.query('SELECT * FROM tx WHERE party_id = ANY($1) AND username <> $2', [common, u.username])).rows : [];
+  return { admin, me: u.username, tx: tx.rows, parties: parties.rows, ctx };
+}
+const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9ऀ-ॿ]+/g, ' ').trim();
+function partyLines(S, p) { return (p.common ? S.tx.concat(S.ctx) : S.tx.filter((t) => t.username === p.owner)).filter((t) => t.party_id === p.id); }
+function partyBal(S, p) { return partyLines(S, p).reduce((b, t) => r2(b + (t.kind === 'out' ? 1 : -1) * Number(t.amount)), 0); }
+function matchParties(S, name) {
+  const q = norm(name); if (!q) return [];
+  const words = q.split(' ');
+  return S.parties.map((p) => { const n = norm(p.name); return { p, score: n === q ? 3 : n.startsWith(q) ? 2 : words.every((w) => n.includes(w)) ? 1 : 0 }; })
+    .filter((x) => x.score).sort((a, b) => b.score - a.score).map((x) => x.p);
+}
+const txOut = (S, t) => ({ date: t.tx_date, type: t.kind, amount: Number(t.amount), notes: t.notes || '', desc: t.descr || undefined,
+  party: t.party_id ? (S.parties.find((p) => p.id === t.party_id) || {}).name : undefined, user: S.admin ? t.username : undefined, transfer: t.transfer_id ? true : undefined });
+async function aiTool(name, a, u, out) {
+  const S = await aiScope(u), today = istToday(), only = (x) => (S.admin && a.user ? x.username === String(a.user).toLowerCase() : true);
+  if (!S.admin && a.user && String(a.user).toLowerCase() !== S.me) return { error: 'You can only see your own cashbook.' };
+  switch (name) {
+    case 'get_summary': {
+      const from = okDate(a.from, today.slice(0, 8) + '01'), to = okDate(a.to, today);
+      const sum = (f) => { let i = 0, o = 0, n = 0, ti = 0, to2 = 0; S.tx.forEach((t) => { if (t.tx_date < from || t.tx_date > to || !only(t) || !f(t)) return;
+        if (t.transfer_id) { t.kind === 'in' ? ti = r2(ti + Number(t.amount)) : to2 = r2(to2 + Number(t.amount)); return; }
+        n++; t.kind === 'in' ? i = r2(i + Number(t.amount)) : o = r2(o + Number(t.amount)); }); return { cash_in: i, cash_out: o, net: r2(i - o), entries: n, transfers_received: ti, transfers_sent: to2 }; };
+      const res = { from, to, ...sum(() => true) };
+      if (S.admin && !a.user) { res.by_user = {}; [...new Set(S.tx.map((t) => t.username))].forEach((n) => { res.by_user[n] = sum((t) => t.username === n); }); }
+      return res;
+    }
+    case 'find_parties': {
+      let list = a.name ? matchParties(S, a.name) : S.parties.slice();
+      list = list.map((p) => ({ p, bal: partyBal(S, p) }));
+      if (a.sort === 'we_owe_most') list.sort((x, y) => x.bal - y.bal); else if (a.sort === 'overdue') list = list.filter((x) => x.p.due && x.p.due < today && x.bal > 0).sort((x, y) => x.p.due.localeCompare(y.p.due));
+      else list.sort((x, y) => y.bal - x.bal);
+      list.slice(0, 3).forEach((x) => out.parties.add(x.p.id));
+      return { count: list.length, parties: list.slice(0, 15).map((x) => ({ name: x.p.name, type: x.p.kind, balance: x.bal, due_date: x.p.due || undefined, owner: S.admin ? (x.p.common ? 'common' : x.p.owner) : undefined })) };
+    }
+    case 'party_details': {
+      const p = matchParties(S, a.name)[0];
+      if (!p) return { error: 'No party found with that name', parties_available: S.parties.slice(0, 30).map((x) => x.name) };
+      out.parties.add(p.id);
+      const lines = partyLines(S, p).slice().sort((x, y) => (x.tx_date + x.tx_time).localeCompare(y.tx_date + y.tx_time) || Number(x.ts) - Number(y.ts));
+      const bal = partyBal(S, p), get = bal > 0, debit = get ? 'out' : 'in', q = []; let carry = 0, lastPay = null;
+      lines.forEach((t) => { const amt = Number(t.amount);
+        if (t.kind === debit) { let left = amt; const use = Math.min(carry, left); left = r2(left - use); carry = r2(carry - use); if (left > 0) q.push({ d: t.tx_date, left }); }
+        else { lastPay = t; let c = amt; while (c > 0 && q.length) { const f = q[0], use = Math.min(f.left, c); f.left = r2(f.left - use); c = r2(c - use); if (f.left <= 0) q.shift(); } if (c > 0) carry = r2(carry + c); } });
+      const age = { '0_30_days': 0, '31_60_days': 0, '60_plus_days': 0 };
+      q.forEach((x) => { const d = Math.round((Date.parse(today) - Date.parse(x.d)) / 864e5); const k = d <= 30 ? '0_30_days' : d <= 60 ? '31_60_days' : '60_plus_days'; age[k] = r2(age[k] + x.left); });
+      return { name: p.name, type: p.kind, phone: p.phone ? 'saved' : 'none', due_date: p.due || undefined, common: p.common || undefined, balance: bal,
+        meaning: bal > 0 ? 'they owe us' : bal < 0 ? 'we owe them' : 'settled', unpaid_by_age: bal ? age : undefined,
+        last_payment: lastPay ? { date: lastPay.tx_date, amount: Number(lastPay.amount) } : null, entries: lines.length, latest: lines.slice(-8).reverse().map((t) => txOut(S, t)) };
+    }
+    case 'search_entries': {
+      const from = okDate(a.from, '0000-00-00'), to = okDate(a.to, '9999-12-31'), words = norm(a.text).split(' ').filter(Boolean);
+      const pids = a.party ? new Set(matchParties(S, a.party).map((p) => p.id)) : null;
+      if (pids) pids.forEach((id) => out.parties.size < 3 && out.parties.add(id));
+      const pn = {}; S.parties.forEach((p) => { pn[p.id] = norm(p.name); });
+      const hits = S.tx.filter((t) => { if (!only(t) || t.tx_date < from || t.tx_date > to) return false; if (a.type && t.kind !== a.type) return false;
+        const amt = Number(t.amount); if (a.min_amount != null && amt < Number(a.min_amount)) return false; if (a.max_amount != null && amt > Number(a.max_amount)) return false;
+        if (pids && !pids.has(t.party_id)) return false;
+        if (words.length) { const hay = norm(t.notes + ' ' + t.descr + ' ' + (pn[t.party_id] || '')); if (!words.every((w) => hay.includes(w))) return false; }
+        return true; }).reverse();
+      let i = 0, o = 0; hits.forEach((t) => { t.kind === 'in' ? i = r2(i + Number(t.amount)) : o = r2(o + Number(t.amount)); });
+      if (words.length) out.search = words.join(' ');
+      return { count: hits.length, total_in: i, total_out: o, entries: hits.slice(0, 25).map((t) => txOut(S, t)), more: hits.length > 25 || undefined };
+    }
+    case 'cash_in_hand': {
+      const bal = {}; S.tx.forEach((t) => { if (!only(t)) return; bal[t.username] = r2((bal[t.username] || 0) + (t.kind === 'in' ? 1 : -1) * Number(t.amount)); });
+      return S.admin ? { by_user: bal, total: r2(Object.values(bal).reduce((x, y) => x + y, 0)) } : { cash_in_hand: bal[S.me] || 0 };
+    }
+    case 'recent_changes': {
+      if (!S.admin) return { error: 'Only the admin can see changes.' };
+      const from = okDate(a.from, today), to = okDate(a.to, today), P = [istMs(from), istMs(to) + 864e5], user = a.user ? String(a.user).toLowerCase() : null;
+      const { rows } = await pool.query(`SELECT h.ts, h.actor, h.owner, h.action, h.changes, COALESCE(h.snapshot, (SELECT s.snapshot FROM tx_history s WHERE s.tx_id = h.tx_id AND s.snapshot IS NOT NULL ORDER BY s.ts DESC LIMIT 1)) snap,
+        (h.action = 'add' AND h.snapshot->>'transfer_id' IS NULL AND h.snapshot->>'tx_date' < to_char((to_timestamp(h.ts / 1000.0) AT TIME ZONE 'Asia/Kolkata') - interval '2 days', 'YYYY-MM-DD')) backdated
+        FROM tx_history h WHERE h.ts >= $1 AND h.ts < $2 ${user ? 'AND (h.owner = $3 OR h.actor = $3)' : ''} ORDER BY h.ts DESC LIMIT 2000`, user ? [...P, user] : P);
+      const list = rows.filter((r) => r.action !== 'add' || r.backdated).map((r) => ({ kind: r.action === 'add' ? 'back-dated' : r.action, by: r.actor, cashbook: r.owner,
+        when: new Date(Number(r.ts) + 330 * 60000).toISOString().slice(0, 16).replace('T', ' '), entry: r.snap ? { date: r.snap.tx_date, type: r.snap.kind, amount: Number(r.snap.amount), notes: r.snap.notes } : undefined,
+        changed: r.changes || undefined }));
+      const per = {}; list.forEach((x) => { const p = per[x.cashbook] = per[x.cashbook] || { edit: 0, delete: 0, restore: 0, 'back-dated': 0 }; p[x.kind]++; });
+      out.exc = true;
+      return { from, to, per_user: per, total: list.length, latest: list.slice(0, 15) };
+    }
+    case 'draft_entry': {
+      if (S.admin) return { error: 'The admin does not add entries. A user has to add this from their phone.' };
+      const amount = r2(Number(a.amount)), type = a.type === 'in' ? 'in' : a.type === 'out' ? 'out' : null;
+      if (!type || !(amount > 0 && amount < 1e11)) return { error: 'Need the amount and whether money came in or went out.' };
+      let party = null, partyNote;
+      if (a.party) { const m = matchParties(S, a.party); if (m.length) party = m[0]; else partyNote = 'No party named "' + a.party + '"; it can be picked in the app.'; }
+      out.draft = { type, amount, notes: String(a.notes || '').trim().slice(0, 200), date: okDate(a.date, today) > today ? today : okDate(a.date, today), party: party ? party.id : null, partyName: party ? party.name : '' };
+      return { prepared: true, not_saved_yet: 'The person must tap Save in the app.', ...out.draft, party: party ? party.name : undefined, note: partyNote };
+    }
+    default: return { error: 'Unknown tool' };
+  }
+}
+const AI_LANG = { en: 'English', hi: 'Hindi in Devanagari script', hg: 'Hinglish (Hindi in English letters)' };
+function aiSystem(u, lang, names) {
+  const admin = u.role === 'admin', today = istToday();
+  return `You are "Ask Khata", the assistant inside a small Indian business's cash book app called Cashflow. Today is ${today} (${new Date(today + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })}), India time.
+You are talking to "${u.username}", who is ${admin ? 'the ADMIN: they supervise every user\'s cashbook and do not add entries themselves' : 'a USER: they see only their own cashbook and the common parties'}.${admin && names.length ? ' Users: ' + names.join(', ') + '.' : ''}
+Rules:
+- Every number must come from a tool result. Never guess or invent amounts, dates, names or balances. If tools return nothing, say so.
+- Use the tools for any question about money, entries, parties, balances or changes. Work out date ranges yourself (this month = ${today.slice(0, 8)}01 to ${today}; "aaj" = today; "kal" usually = yesterday).
+- In = cash received (paisa aaya). Out = cash paid (paisa gaya). A party balance above 0 means they owe us; below 0 means we owe them.
+- Money as ₹ with Indian grouping (₹1,25,000). Dates like 24 Oct.
+- Keep answers short: 1–4 sentences or a short list. Use **bold** for key amounts. No tables.
+- If asked to add/record money, call draft_entry. Then say it is ready and ask them to tap Save. Never say it is saved.
+- You cannot edit or delete entries or change settings; say they can do it in the app.
+- Only answer about this cash book and simple business advice from its numbers. Politely decline anything else.
+- Reply in ${AI_LANG[lang] || 'the same language as the question'}.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
+}
+async function gemini(c, body) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 40000);
+  try {
+    const r = await fetch(GEMINI_URL + encodeURIComponent(c.model) + ':generateContent', { method: 'POST', signal: ctl.signal,
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 429) { const e = new Error('The free Gemini limit is used up for now. Try again in a minute, or tomorrow.'); e.code = 429; throw e; }
+    if (r.status === 400 && /API key/i.test((j.error && j.error.message) || '')) throw new Error('The Gemini key is not valid. The admin can paste a new one in Ask Khata settings.');
+    if (r.status === 403) throw new Error('Google refused the Gemini key (403). Check the key in Ask Khata settings.');
+    if (!r.ok) throw new Error('Gemini error ' + r.status + ((j.error && j.error.message) ? ': ' + String(j.error.message).slice(0, 150) : ''));
+    return j;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Gemini took too long to answer. Try again.');
+    if (e.message && e.message.startsWith('fetch failed')) throw new Error('Could not reach Gemini. Try again.');
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+// Questions per person per India day, so one phone cannot use up the free limit for everyone.
+async function aiCount(u, limit) {
+  const day = istToday();
+  await pool.query('DELETE FROM ai_usage WHERE day < $1', [day]);
+  const r = await pool.query(`INSERT INTO ai_usage (day, username, n) VALUES ($1, $2, 1) ON CONFLICT (day, username) DO UPDATE SET n = ai_usage.n + 1 RETURNING n`, [day, u]);
+  return r.rows[0].n <= limit;
+}
+app.post('/api/ai/chat', auth, wrap(async (req, res) => {
+  const c = await aiCfg();
+  if (!c.key) return res.status(400).json({ error: req.user.role === 'admin' ? 'Add your free Gemini key in Ask Khata settings first.' : 'Ask Khata is not set up yet. Ask the admin to add the Gemini key.', setup: true });
+  const msgs = Array.isArray(req.body.messages) ? req.body.messages.slice(-12) : [];
+  const contents = msgs.filter((m) => m && typeof m.text === 'string' && m.text.trim()).map((m) => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: m.text.slice(0, 1500) }] }));
+  if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'Type a question' });
+  if (!(await aiCount(req.user.username, c.limit))) return res.status(429).json({ error: 'You have asked ' + c.limit + ' questions today, the daily limit. Ask again tomorrow.' });
+  const lang = ['en', 'hi', 'hg'].includes(req.body.lang) ? req.body.lang : '';
+  const names = req.user.role === 'admin' ? (await pool.query("SELECT username FROM users WHERE role = 'user' ORDER BY username")).rows.map((r) => r.username) : [];
+  const body = { systemInstruction: { parts: [{ text: aiSystem(req.user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 1024 } };
+  const out = { parties: new Set(), draft: null, search: null, exc: false };
+  try {
+    for (let round = 0; round < 6; round++) {
+      const j = await gemini(c, body), cand = (j.candidates || [])[0];
+      const parts = (cand && cand.content && cand.content.parts) || [];
+      const calls = parts.filter((p) => p.functionCall);
+      if (!calls.length) {
+        const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
+        if (!text) throw new Error(cand && cand.finishReason === 'SAFETY' ? 'Gemini would not answer that. Try asking differently.' : 'Gemini gave no answer. Try again.');
+        const ids = [...out.parties].slice(0, 3), rows = ids.length ? (await pool.query('SELECT id, name FROM parties WHERE id = ANY($1)', [ids])).rows : [];
+        const parties = ids.map((id) => rows.find((p) => p.id === id)).filter(Boolean).map((p) => ({ id: p.id, name: p.name }));
+        return res.json({ text: text.slice(0, 4000), draft: out.draft, parties, search: out.search, exc: out.exc && req.user.role === 'admin' });
+      }
+      body.contents.push(cand.content);
+      const responses = [];
+      for (const p of calls) {
+        let r;
+        try { r = await aiTool(p.functionCall.name, p.functionCall.args || {}, req.user, out); } catch (e) { console.error('ai tool failed:', e.message); r = { error: 'Could not read the books just now' }; }
+        responses.push({ functionResponse: { name: p.functionCall.name, response: r } });
+      }
+      body.contents.push({ role: 'user', parts: responses });
+    }
+    throw new Error('That needed too many steps. Try a simpler question.');
+  } catch (e) { return res.status(e.code === 429 ? 429 : 502).json({ error: e.message }); }
+}));
+app.get('/api/ai', auth, adminOnly, wrap(async (req, res) => res.json(aiView(await aiCfg()))));
+app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
+  const c = await aiCfg(), b = req.body || {};
+  const key = b.key == null ? null : String(b.key).trim().slice(0, 200), model = AI_MODELS.includes(b.model) ? b.model : c.model, limit = Math.round(Number(b.limit));
+  if (!(limit >= 5 && limit <= 500)) return res.status(400).json({ error: 'Daily limit must be between 5 and 500' });
+  if (key != null && key && !/^[\w-]{20,200}$/.test(key)) return res.status(400).json({ error: 'That does not look like a Gemini API key' });
+  // Once a key is saved, replacing or removing it needs the admin's password.
+  if (key != null && c.key && !c.fromEnv) {
+    const k = 'pw|' + req.user.username;
+    if (await limited(k)) return res.status(429).json({ error: 'Too many wrong passwords. Try again in 15 minutes.' });
+    const h = (await pool.query('SELECT pass_hash FROM users WHERE username = $1', [req.user.username])).rows[0];
+    if (!b.password || !h || !(await bcrypt.compare(String(b.password), h.pass_hash))) { await addFail(k); return res.status(403).json({ error: b.password ? 'Wrong password' : 'Enter your password to change the key' }); }
+    await pool.query('DELETE FROM login_fails WHERE k = $1', [k]);
+  }
+  await pool.query('UPDATE settings SET ai_model = $1, ai_limit = $2' + (key != null ? ', ai_key = $3' : '') + ' WHERE id = 1', key != null ? [model, limit, key] : [model, limit]);
+  res.json(aiView(await aiCfg()));
+}));
+app.post('/api/ai/test', auth, adminOnly, wrap(async (req, res) => {
+  const c = await aiCfg();
+  if (!c.key) return res.status(400).json({ error: 'Paste your Gemini key first' });
+  try {
+    const j = await gemini(c, { contents: [{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], generationConfig: { maxOutputTokens: 20 } });
+    const ok = ((((j.candidates || [])[0] || {}).content || {}).parts || []).some((p) => p.text);
+    if (!ok) throw new Error('Gemini answered, but with nothing. Try another model.');
+  } catch (e) { return res.status(400).json({ error: e.message }); }
+  res.json({ ok: true });
 }));
 
 // ---- Push notification routes ----
