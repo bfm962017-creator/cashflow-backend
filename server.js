@@ -1412,6 +1412,24 @@ function thinkCfg(model) {
   if (/gemini-2\.5/.test(model)) return { thinkingBudget: /pro/.test(model) ? 128 : 0 };
   return null;
 }
+// Each Gemini model has its own free quota and its own busy times. When one is used up, busy or silent,
+// try the next model the key can use (lite first), keep it for the rest of the question and save it.
+async function geminiNext(c, body, retried, why) {
+  const tried = (c.tried || []).concat(c.model), left = c.deadline ? c.deadline - Date.now() : 60000;
+  if (tried.length >= 6 || left < 8000) return null;
+  let next = null;
+  try { next = (await listModels(c)).filter((n) => !tried.includes(n)).sort((a, b) => /lite/.test(b) - /lite/.test(a))[0]; } catch (x) { /* none */ }
+  if (!next) return null;
+  console.log('gemini model', c.model, why + '; trying', next);
+  c.tried = tried; c.model = next;
+  // Thought signatures belong to the model that made them; drop them before handing the turns to another model.
+  body.contents = body.contents.map((t) => (t.role === 'model' ? { ...t, parts: t.parts.filter((p) => !p.thought).map(({ thoughtSignature, ...p }) => p) } : t));
+  body.noThink = false;
+  const j = await gemini(c, body, retried);
+  await pool.query('UPDATE settings SET ai_model = $1 WHERE id = 1', [c.model]);
+  return j;
+}
+const AI_ALL_USED = 'The free Gemini limit is used up on all models for now. It resets once a day (around 1:30 PM India time); short limits clear in a minute.';
 async function gemini(c, body, retried) {
   if (!body.noThink) { const t = thinkCfg(c.model); body.generationConfig = { ...(body.generationConfig || {}) }; if (t) body.generationConfig.thinkingConfig = t; else delete body.generationConfig.thinkingConfig; }
   // Google: Gemini 3 should run at its default temperature; low values can make it loop until it times out.
@@ -1429,7 +1447,13 @@ async function gemini(c, body, retried) {
     { const cd = (j.candidates || [])[0] || {}, u = j.usageMetadata || {};
       console.log('gemini', c.model, r.status, (Date.now() - t0) + 'ms', cd.finishReason || '', 'parts:' + ((cd.content && cd.content.parts) || []).map((p) => p.functionCall ? 'call:' + p.functionCall.name : p.thought ? 'thought' : p.text ? 'text' : '?').join(','),
         'tokens:' + (u.promptTokenCount || 0) + '/' + (u.thoughtsTokenCount || 0) + '/' + (u.candidatesTokenCount || 0)); }
-    if (r.status === 429) { const e = new Error('The free Gemini limit is used up for now. Try again in a minute, or tomorrow.'); e.code = 429; throw e; }
+    if (r.status === 429 || r.status === 503) {
+      console.log('gemini', c.model, r.status, String((j.error && j.error.message) || '').slice(0, 300));
+      clearTimeout(timer);
+      const j2 = await geminiNext(c, body, retried, r.status === 429 ? 'limit used up' : 'busy');
+      if (j2) return j2;
+      const e = new Error(r.status === 429 ? AI_ALL_USED : 'Gemini is very busy right now. Try again in a minute.'); e.code = 429; throw e;
+    }
     if (r.status === 400 && /API key/i.test((j.error && j.error.message) || '')) throw new Error('The Gemini key is not valid. The admin can paste a new one in Ask Khata settings.');
     if (r.status === 403) throw new Error('Google refused the Gemini key (403). Check the key in Ask Khata settings.');
     // A model that does not take the thinking setting: ask again without it.
@@ -1452,20 +1476,9 @@ async function gemini(c, body, retried) {
     return j;
   } catch (e) {
     if (e.name === 'AbortError') {
-      // This model is not answering (seen with gemini-3.8-flash on free keys): try the next model the key can use, keep the one that answers.
-      const tried = (c.tried || []).concat(c.model), left2 = c.deadline ? c.deadline - Date.now() : 60000;
-      if (tried.length < 3 && left2 > 15000) {
-        let next = null;
-        try { const all = await listModels(c); next = all.filter((n) => !tried.includes(n)).sort((a, b) => /lite/.test(b) - /lite/.test(a))[0]; } catch (x) { /* none */ }
-        if (next) {
-          console.log('gemini model', c.model, 'did not answer; trying', next);
-          c.tried = tried; c.model = next;   // later rounds of this question use it too
-          body.noThink = false;
-          const j2 = await gemini(c, body, retried);
-          await pool.query('UPDATE settings SET ai_model = $1 WHERE id = 1', [next]);
-          return j2;
-        }
-      }
+      // This model is not answering (seen with gemini-3.8-flash on free keys).
+      const j2 = await geminiNext(c, body, retried, 'did not answer');
+      if (j2) return j2;
       throw new Error('Gemini (' + c.model + ') is not answering right now. Pick another model in Ask Khata settings, or try again later.');
     }
     if (e.message && e.message.startsWith('fetch failed')) throw new Error('Could not reach Gemini. Try again.');
