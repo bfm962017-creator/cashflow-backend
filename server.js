@@ -1418,7 +1418,8 @@ async function gemini(c, body, retried) {
   if (/gemini-[3-9]/.test(c.model) && body.generationConfig) delete body.generationConfig.temperature;
   const left = c.deadline ? c.deadline - Date.now() : 40000;
   if (left < 4000) throw new Error('That took too long. Try a shorter or simpler question.');
-  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), Math.min(45000, left));
+  // The first try gets 25s (Gemini normally answers in a few); if the model does not answer, another one is tried.
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), Math.min(c.tried && c.tried.length ? 45000 : 25000, left));
   try {
     const { noThink, ...send } = body, t0 = Date.now();
     console.log('gemini call', c.model, JSON.stringify(send.generationConfig || {}), 'tools:' + !!send.tools, 'turns:' + (send.contents || []).length);
@@ -1442,14 +1443,31 @@ async function gemini(c, body, retried) {
         console.log('gemini model', c.model, 'unavailable; switching to', next);
         await pool.query('UPDATE settings SET ai_model = $1 WHERE id = 1', [next]);
         clearTimeout(timer);
-        return gemini({ ...c, model: next }, body, true);
+        c.model = next;
+        return gemini(c, body, true);
       }
     }
     if (r.status === 404) throw new Error('The Gemini model "' + c.model + '" is not available. Pick another model in Ask Khata settings.');
     if (!r.ok) throw new Error('Gemini error ' + r.status + ((j.error && j.error.message) ? ': ' + String(j.error.message).slice(0, 150) : ''));
     return j;
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Gemini took too long to answer. Try a shorter or simpler question.');
+    if (e.name === 'AbortError') {
+      // This model is not answering (seen with gemini-3.8-flash on free keys): try the next model the key can use, keep the one that answers.
+      const tried = (c.tried || []).concat(c.model), left2 = c.deadline ? c.deadline - Date.now() : 60000;
+      if (tried.length < 3 && left2 > 15000) {
+        let next = null;
+        try { const all = await listModels(c); next = all.filter((n) => !tried.includes(n)).sort((a, b) => /lite/.test(b) - /lite/.test(a))[0]; } catch (x) { /* none */ }
+        if (next) {
+          console.log('gemini model', c.model, 'did not answer; trying', next);
+          c.tried = tried; c.model = next;   // later rounds of this question use it too
+          body.noThink = false;
+          const j2 = await gemini(c, body, retried);
+          await pool.query('UPDATE settings SET ai_model = $1 WHERE id = 1', [next]);
+          return j2;
+        }
+      }
+      throw new Error('Gemini (' + c.model + ') is not answering right now. Pick another model in Ask Khata settings, or try again later.');
+    }
     if (e.message && e.message.startsWith('fetch failed')) throw new Error('Could not reach Gemini. Try again.');
     throw e;
   } finally { clearTimeout(timer); }
