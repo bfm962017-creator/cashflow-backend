@@ -1405,15 +1405,27 @@ Rules:
 - Only answer about this cash book and simple business advice from its numbers. Politely decline anything else.
 - Reply in ${AI_LANG[lang] || 'the same language as the question'}.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
 }
+// Short thinking: answers come from tool numbers, and a long think can run past the server's time limit.
+function thinkCfg(model) {
+  if (/gemini-[3-9]/.test(model)) return { thinkingLevel: 'low' };
+  if (/gemini-2\.5/.test(model)) return { thinkingBudget: /pro/.test(model) ? 128 : 0 };
+  return null;
+}
 async function gemini(c, body, retried) {
-  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 40000);
+  if (!body.noThink) { const t = thinkCfg(c.model); body.generationConfig = { ...(body.generationConfig || {}) }; if (t) body.generationConfig.thinkingConfig = t; else delete body.generationConfig.thinkingConfig; }
+  const left = c.deadline ? c.deadline - Date.now() : 40000;
+  if (left < 4000) throw new Error('That took too long. Try a shorter or simpler question.');
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), Math.min(45000, left));
   try {
+    const { noThink, ...send } = body;
     const r = await fetch(GEMINI_URL + encodeURIComponent(c.model) + ':generateContent', { method: 'POST', signal: ctl.signal,
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key }, body: JSON.stringify(body) });
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key }, body: JSON.stringify(send) });
     const j = await r.json().catch(() => ({}));
     if (r.status === 429) { const e = new Error('The free Gemini limit is used up for now. Try again in a minute, or tomorrow.'); e.code = 429; throw e; }
     if (r.status === 400 && /API key/i.test((j.error && j.error.message) || '')) throw new Error('The Gemini key is not valid. The admin can paste a new one in Ask Khata settings.');
     if (r.status === 403) throw new Error('Google refused the Gemini key (403). Check the key in Ask Khata settings.');
+    // A model that does not take the thinking setting: ask again without it.
+    if (r.status === 400 && /think/i.test(String((j.error && j.error.message) || '')) && !body.noThink) { clearTimeout(timer); body.noThink = true; delete body.generationConfig.thinkingConfig; return gemini(c, body, retried); }
     // A retired or unknown model: switch to the one Google suggests (or the best one it lists), save it and retry once.
     const msg = String((j.error && j.error.message) || '');
     if (!retried && (r.status === 404 || (r.status === 400 && /model/i.test(msg) && /(not found|no longer|not supported|unavailable)/i.test(msg)))) {
@@ -1430,7 +1442,7 @@ async function gemini(c, body, retried) {
     if (!r.ok) throw new Error('Gemini error ' + r.status + ((j.error && j.error.message) ? ': ' + String(j.error.message).slice(0, 150) : ''));
     return j;
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Gemini took too long to answer. Try again.');
+    if (e.name === 'AbortError') throw new Error('Gemini took too long to answer. Try a shorter or simpler question.');
     if (e.message && e.message.startsWith('fetch failed')) throw new Error('Could not reach Gemini. Try again.');
     throw e;
   } finally { clearTimeout(timer); }
@@ -1453,6 +1465,8 @@ app.post('/api/ai/chat', auth, wrap(async (req, res) => {
   const names = req.user.role === 'admin' ? (await pool.query("SELECT username FROM users WHERE role = 'user' ORDER BY username")).rows.map((r) => r.username) : [];
   const body = { systemInstruction: { parts: [{ text: aiSystem(req.user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };
   const out = { parties: new Set(), draft: null, search: null, exc: false };
+  // Stay inside the server's time limit (vercel.json maxDuration) with room to reply.
+  c.deadline = Date.now() + Number(process.env.AI_BUDGET_MS || 100000);
   try {
     for (let round = 0; round < 6; round++) {
       const j = await gemini(c, body), cand = (j.candidates || [])[0];
@@ -1475,7 +1489,7 @@ app.post('/api/ai/chat', auth, wrap(async (req, res) => {
       body.contents.push({ role: 'user', parts: responses });
     }
     throw new Error('That needed too many steps. Try a simpler question.');
-  } catch (e) { return res.status(e.code === 429 ? 429 : 502).json({ error: e.message }); }
+  } catch (e) { console.error('ask khata failed:', c.model, e.message); return res.status(e.code === 429 ? 429 : 502).json({ error: e.message }); }
 }));
 app.get('/api/ai', auth, adminOnly, wrap(async (req, res) => res.json(aiView(await aiCfg()))));
 app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
