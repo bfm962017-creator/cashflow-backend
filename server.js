@@ -1413,14 +1413,19 @@ function thinkCfg(model) {
 }
 async function gemini(c, body, retried) {
   if (!body.noThink) { const t = thinkCfg(c.model); body.generationConfig = { ...(body.generationConfig || {}) }; if (t) body.generationConfig.thinkingConfig = t; else delete body.generationConfig.thinkingConfig; }
+  // Google: Gemini 3 should run at its default temperature; low values can make it loop until it times out.
+  if (/gemini-[3-9]/.test(c.model) && body.generationConfig) delete body.generationConfig.temperature;
   const left = c.deadline ? c.deadline - Date.now() : 40000;
   if (left < 4000) throw new Error('That took too long. Try a shorter or simpler question.');
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), Math.min(45000, left));
   try {
-    const { noThink, ...send } = body;
+    const { noThink, ...send } = body, t0 = Date.now();
     const r = await fetch(GEMINI_URL + encodeURIComponent(c.model) + ':generateContent', { method: 'POST', signal: ctl.signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key }, body: JSON.stringify(send) });
     const j = await r.json().catch(() => ({}));
+    { const cd = (j.candidates || [])[0] || {}, u = j.usageMetadata || {};
+      console.log('gemini', c.model, r.status, (Date.now() - t0) + 'ms', cd.finishReason || '', 'parts:' + ((cd.content && cd.content.parts) || []).map((p) => p.functionCall ? 'call:' + p.functionCall.name : p.thought ? 'thought' : p.text ? 'text' : '?').join(','),
+        'tokens:' + (u.promptTokenCount || 0) + '/' + (u.thoughtsTokenCount || 0) + '/' + (u.candidatesTokenCount || 0)); }
     if (r.status === 429) { const e = new Error('The free Gemini limit is used up for now. Try again in a minute, or tomorrow.'); e.code = 429; throw e; }
     if (r.status === 400 && /API key/i.test((j.error && j.error.message) || '')) throw new Error('The Gemini key is not valid. The admin can paste a new one in Ask Khata settings.');
     if (r.status === 403) throw new Error('Google refused the Gemini key (403). Check the key in Ask Khata settings.');
@@ -1454,6 +1459,37 @@ async function aiCount(u, limit) {
   const r = await pool.query(`INSERT INTO ai_usage (day, username, n) VALUES ($1, $2, 1) ON CONFLICT (day, username) DO UPDATE SET n = ai_usage.n + 1 RETURNING n`, [day, u]);
   return r.rows[0].n <= limit;
 }
+// One question → answer: Gemini may call tools (run here with the asker's permissions) for up to 6 rounds.
+async function aiAnswer(c, user, contents, lang) {
+  const names = user.role === 'admin' ? (await pool.query("SELECT username FROM users WHERE role = 'user' ORDER BY username")).rows.map((r) => r.username) : [];
+  const body = { systemInstruction: { parts: [{ text: aiSystem(user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };
+  const out = { parties: new Set(), draft: null, search: null, exc: false, steps: 0 };
+  // Stay inside the server's time limit (vercel.json maxDuration) with room to reply.
+  c = { ...c, deadline: Date.now() + Number(process.env.AI_BUDGET_MS || 100000) };
+  for (let round = 0; round < 6; round++) {
+    const j = await gemini(c, body), cand = (j.candidates || [])[0];
+    const parts = (cand && cand.content && cand.content.parts) || [];
+    const calls = parts.filter((p) => p.functionCall);
+    if (!calls.length) {
+      const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
+      if (!text) throw new Error(cand && cand.finishReason === 'SAFETY' ? 'Gemini would not answer that. Try asking differently.'
+        : cand && cand.finishReason === 'MAX_TOKENS' ? 'Gemini ran out of room before answering. Try a simpler question.' : 'Gemini gave no answer. Try again.');
+      const ids = [...out.parties].slice(0, 3), rows = ids.length ? (await pool.query('SELECT id, name FROM parties WHERE id = ANY($1)', [ids])).rows : [];
+      const parties = ids.map((id) => rows.find((p) => p.id === id)).filter(Boolean).map((p) => ({ id: p.id, name: p.name }));
+      return { text: text.slice(0, 4000), draft: out.draft, parties, search: out.search, exc: out.exc && user.role === 'admin', steps: out.steps };
+    }
+    body.contents.push(cand.content);
+    const responses = [];
+    for (const p of calls) {
+      let r;
+      out.steps++;
+      try { r = await aiTool(p.functionCall.name, p.functionCall.args || {}, user, out); } catch (e) { console.error('ai tool failed:', e.message); r = { error: 'Could not read the books just now' }; }
+      responses.push({ functionResponse: { name: p.functionCall.name, ...(p.functionCall.id ? { id: p.functionCall.id } : {}), response: r } });
+    }
+    body.contents.push({ role: 'user', parts: responses });
+  }
+  throw new Error('That needed too many steps. Try a simpler question.');
+}
 app.post('/api/ai/chat', auth, wrap(async (req, res) => {
   const c = await aiCfg();
   if (!c.key) return res.status(400).json({ error: req.user.role === 'admin' ? 'Add your free Gemini key in Ask Khata settings first.' : 'Ask Khata is not set up yet. Ask the admin to add the Gemini key.', setup: true });
@@ -1462,34 +1498,12 @@ app.post('/api/ai/chat', auth, wrap(async (req, res) => {
   if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'Type a question' });
   if (!(await aiCount(req.user.username, c.limit))) return res.status(429).json({ error: 'You have asked ' + c.limit + ' questions today, the daily limit. Ask again tomorrow.' });
   const lang = ['en', 'hi', 'hg'].includes(req.body.lang) ? req.body.lang : '';
-  const names = req.user.role === 'admin' ? (await pool.query("SELECT username FROM users WHERE role = 'user' ORDER BY username")).rows.map((r) => r.username) : [];
-  const body = { systemInstruction: { parts: [{ text: aiSystem(req.user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };
-  const out = { parties: new Set(), draft: null, search: null, exc: false };
-  // Stay inside the server's time limit (vercel.json maxDuration) with room to reply.
-  c.deadline = Date.now() + Number(process.env.AI_BUDGET_MS || 100000);
+  const t0 = Date.now();
   try {
-    for (let round = 0; round < 6; round++) {
-      const j = await gemini(c, body), cand = (j.candidates || [])[0];
-      const parts = (cand && cand.content && cand.content.parts) || [];
-      const calls = parts.filter((p) => p.functionCall);
-      if (!calls.length) {
-        const text = parts.filter((p) => p.text && !p.thought).map((p) => p.text).join('').trim();
-        if (!text) throw new Error(cand && cand.finishReason === 'SAFETY' ? 'Gemini would not answer that. Try asking differently.' : 'Gemini gave no answer. Try again.');
-        const ids = [...out.parties].slice(0, 3), rows = ids.length ? (await pool.query('SELECT id, name FROM parties WHERE id = ANY($1)', [ids])).rows : [];
-        const parties = ids.map((id) => rows.find((p) => p.id === id)).filter(Boolean).map((p) => ({ id: p.id, name: p.name }));
-        return res.json({ text: text.slice(0, 4000), draft: out.draft, parties, search: out.search, exc: out.exc && req.user.role === 'admin' });
-      }
-      body.contents.push(cand.content);
-      const responses = [];
-      for (const p of calls) {
-        let r;
-        try { r = await aiTool(p.functionCall.name, p.functionCall.args || {}, req.user, out); } catch (e) { console.error('ai tool failed:', e.message); r = { error: 'Could not read the books just now' }; }
-        responses.push({ functionResponse: { name: p.functionCall.name, response: r } });
-      }
-      body.contents.push({ role: 'user', parts: responses });
-    }
-    throw new Error('That needed too many steps. Try a simpler question.');
-  } catch (e) { console.error('ask khata failed:', c.model, e.message); return res.status(e.code === 429 ? 429 : 502).json({ error: e.message }); }
+    const r = await aiAnswer(c, req.user, contents, lang);
+    console.log('ask khata ok', c.model, (Date.now() - t0) + 'ms', r.steps + ' lookups');
+    res.json(r);
+  } catch (e) { console.error('ask khata failed:', c.model, (Date.now() - t0) + 'ms', e.message); return res.status(e.code === 429 ? 429 : 502).json({ error: e.message }); }
 }));
 app.get('/api/ai', auth, adminOnly, wrap(async (req, res) => res.json(aiView(await aiCfg()))));
 app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
@@ -1518,11 +1532,16 @@ app.post('/api/ai/test', auth, adminOnly, wrap(async (req, res) => {
   const c = await aiCfg();
   if (!c.key) return res.status(400).json({ error: 'Paste your Gemini key first' });
   try {
-    const j = await gemini(c, { contents: [{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], generationConfig: { maxOutputTokens: 512 } });
+    const t0 = Date.now(), j = await gemini(c, { contents: [{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], generationConfig: { maxOutputTokens: 512 } });
     const ok = ((((j.candidates || [])[0] || {}).content || {}).parts || []).some((p) => p.text);
     if (!ok) throw new Error('Gemini answered, but with nothing. Try another model.');
-  } catch (e) { return res.status(400).json({ error: e.message }); }
-  res.json({ ok: true, model: (await aiCfg()).model });
+    const c2 = await aiCfg(), t1 = Date.now();
+    // A real question with a lookup, the same way the chat works.
+    let r;
+    try { r = await aiAnswer(c2, req.user, [{ role: 'user', parts: [{ text: 'What is the total cash in today?' }] }], 'en'); }
+    catch (e) { throw new Error('Gemini connects (' + (t1 - t0) + ' ms) but a real question failed: ' + e.message); }
+    return res.json({ ok: true, model: c2.model, ms: Date.now() - t1, lookups: r.steps });
+  } catch (e) { console.error('ask khata test failed:', e.message); return res.status(400).json({ error: e.message }); }
 }));
 
 // ---- Push notification routes ----
