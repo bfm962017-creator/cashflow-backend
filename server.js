@@ -1403,7 +1403,7 @@ Rules:
 - If asked to add/record money, call draft_entry. Then say it is ready and ask them to tap Save. Never say it is saved.
 - You cannot edit or delete entries or change settings; say they can do it in the app.
 - Only answer about this cash book and simple business advice from its numbers. Politely decline anything else.
-- Reply in ${AI_LANG[lang] || 'the same language as the question'}.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
+- LANGUAGE: reply in the same language and script as the person's latest message. If they write Hinglish (Hindi words in English letters, e.g. "aaj ka hisaab", "Gupta ka kitna baaki hai"), reply in Hinglish the same way (e.g. "Aaj **₹12,500** aaya aur **₹3,200** gaya."). If they write in Devanagari, reply in Hindi (Devanagari). If they write in English, reply in English. Only if you cannot tell, use ${AI_LANG[lang] || 'English'}. Keep app words like Cash In, Cash Out, party and entry as they are.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
 }
 // Short thinking on Gemini 2.5. Gemini 3 is left on its own defaults: in production, calls to
 // gemini-3.8-flash with a thinkingLevel (or a low temperature) never answered, while plain calls did.
