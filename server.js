@@ -51,7 +51,7 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_keep INT NOT NULL DEFAULT 90
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_last TEXT NOT NULL DEFAULT '';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS drive_err TEXT NOT NULL DEFAULT '';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_key TEXT NOT NULL DEFAULT '';
-ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_model TEXT NOT NULL DEFAULT 'gemini-2.5-flash';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_model TEXT NOT NULL DEFAULT 'gemini-flash-latest';
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS ai_limit INT NOT NULL DEFAULT 50;
 CREATE TABLE IF NOT EXISTS ai_usage (day TEXT NOT NULL, username TEXT NOT NULL, n INT NOT NULL DEFAULT 0, PRIMARY KEY (day, username));
 CREATE TABLE IF NOT EXISTS drive_log (id BIGSERIAL PRIMARY KEY, ts BIGINT NOT NULL, ok BOOLEAN NOT NULL, bytes INT NOT NULL DEFAULT 0, msg TEXT NOT NULL DEFAULT '');
@@ -1248,7 +1248,20 @@ app.get('/api/cron/daily', wrap(async (req, res) => {
 // person saves from the app with the normal entry checks. The key is pasted by the admin (or set in
 // GEMINI_API_KEY) and never sent back to the app.
 const GEMINI_URL = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com/v1beta/models/';
-const AI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'];
+// Google retires model names over time, so the list comes from Google (listModels) and a retired model
+// is replaced automatically when Google's error names the new one.
+const AI_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+const MODEL_RE = /^[\w.-]{3,80}$/;
+async function listModels(c) {
+  const r = await fetch(GEMINI_URL.replace(/\/$/, '') + '?pageSize=200', { headers: { 'x-goog-api-key': c.key } });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('Could not list Gemini models (' + r.status + ')');
+  const ver = (n) => Number((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  return (j.models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map((m) => String(m.name || '').replace(/^models\//, ''))
+    .filter((n) => /^gemini-/.test(n) && /(flash|pro)/.test(n) && !/(tts|image|audio|live|embedding|vision|exp|preview|thinking)/.test(n))
+    .sort((a, b) => (/flash/.test(b) - /flash/.test(a)) || (/lite/.test(a) - /lite/.test(b)) || ver(b) - ver(a) || a.length - b.length);
+}
 async function aiCfg() {
   const r = (await pool.query('SELECT ai_key, ai_model, ai_limit FROM settings WHERE id = 1')).rows[0];
   return { key: process.env.GEMINI_API_KEY || r.ai_key, fromEnv: !!process.env.GEMINI_API_KEY, model: r.ai_model, limit: r.ai_limit };
@@ -1392,7 +1405,7 @@ Rules:
 - Only answer about this cash book and simple business advice from its numbers. Politely decline anything else.
 - Reply in ${AI_LANG[lang] || 'the same language as the question'}.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
 }
-async function gemini(c, body) {
+async function gemini(c, body, retried) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 40000);
   try {
     const r = await fetch(GEMINI_URL + encodeURIComponent(c.model) + ':generateContent', { method: 'POST', signal: ctl.signal,
@@ -1401,6 +1414,19 @@ async function gemini(c, body) {
     if (r.status === 429) { const e = new Error('The free Gemini limit is used up for now. Try again in a minute, or tomorrow.'); e.code = 429; throw e; }
     if (r.status === 400 && /API key/i.test((j.error && j.error.message) || '')) throw new Error('The Gemini key is not valid. The admin can paste a new one in Ask Khata settings.');
     if (r.status === 403) throw new Error('Google refused the Gemini key (403). Check the key in Ask Khata settings.');
+    // A retired or unknown model: switch to the one Google suggests (or the best one it lists), save it and retry once.
+    const msg = String((j.error && j.error.message) || '');
+    if (!retried && (r.status === 404 || (r.status === 400 && /model/i.test(msg) && /(not found|no longer|not supported|unavailable)/i.test(msg)))) {
+      let next = [...msg.matchAll(/models\/([\w.-]+)/g)].map((m) => m[1].replace(/[.]+$/, '')).find((n) => n !== c.model && MODEL_RE.test(n));
+      if (!next) { try { next = (await listModels(c)).find((n) => n !== c.model); } catch (e) { /* fall through to the error */ } }
+      if (next) {
+        console.log('gemini model', c.model, 'unavailable; switching to', next);
+        await pool.query('UPDATE settings SET ai_model = $1 WHERE id = 1', [next]);
+        clearTimeout(timer);
+        return gemini({ ...c, model: next }, body, true);
+      }
+    }
+    if (r.status === 404) throw new Error('The Gemini model "' + c.model + '" is not available. Pick another model in Ask Khata settings.');
     if (!r.ok) throw new Error('Gemini error ' + r.status + ((j.error && j.error.message) ? ': ' + String(j.error.message).slice(0, 150) : ''));
     return j;
   } catch (e) {
@@ -1425,7 +1451,7 @@ app.post('/api/ai/chat', auth, wrap(async (req, res) => {
   if (!(await aiCount(req.user.username, c.limit))) return res.status(429).json({ error: 'You have asked ' + c.limit + ' questions today, the daily limit. Ask again tomorrow.' });
   const lang = ['en', 'hi', 'hg'].includes(req.body.lang) ? req.body.lang : '';
   const names = req.user.role === 'admin' ? (await pool.query("SELECT username FROM users WHERE role = 'user' ORDER BY username")).rows.map((r) => r.username) : [];
-  const body = { systemInstruction: { parts: [{ text: aiSystem(req.user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 1024 } };
+  const body = { systemInstruction: { parts: [{ text: aiSystem(req.user, lang, names) }] }, contents, tools: [{ functionDeclarations: AI_TOOLS }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };
   const out = { parties: new Set(), draft: null, search: null, exc: false };
   try {
     for (let round = 0; round < 6; round++) {
@@ -1455,7 +1481,7 @@ app.get('/api/ai', auth, adminOnly, wrap(async (req, res) => res.json(aiView(awa
 app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
   const c = await aiCfg(), b = req.body || {};
   // Pasted keys often carry spaces, line breaks or quotes from the copy; Google's own check (Test) decides if it works.
-  const key = b.key == null ? null : String(b.key).replace(/\s+/g, '').replace(/^["'`]+|["'`]+$/g, '').slice(0, 300), model = AI_MODELS.includes(b.model) ? b.model : c.model, limit = Math.round(Number(b.limit));
+  const key = b.key == null ? null : String(b.key).replace(/\s+/g, '').replace(/^["'`]+|["'`]+$/g, '').slice(0, 300), model = MODEL_RE.test(String(b.model || '')) ? String(b.model) : c.model, limit = Math.round(Number(b.limit));
   if (!(limit >= 5 && limit <= 500)) return res.status(400).json({ error: 'Daily limit must be between 5 and 500' });
   if (key != null && key && !/^[\x21-\x7e]{20,300}$/.test(key)) return res.status(400).json({ error: 'That key looks incomplete. Copy the whole key from Google AI Studio (it is usually about 39 characters) and paste it again.' });
   // Once a key is saved, replacing or removing it needs the admin's password.
@@ -1469,15 +1495,20 @@ app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
   await pool.query('UPDATE settings SET ai_model = $1, ai_limit = $2' + (key != null ? ', ai_key = $3' : '') + ' WHERE id = 1', key != null ? [model, limit, key] : [model, limit]);
   res.json(aiView(await aiCfg()));
 }));
+app.get('/api/ai/models', auth, adminOnly, wrap(async (req, res) => {
+  const c = await aiCfg();
+  if (!c.key) return res.json({ models: AI_MODELS });
+  try { const m = await listModels(c); res.json({ models: m.length ? m : AI_MODELS }); } catch (e) { res.json({ models: AI_MODELS, error: e.message }); }
+}));
 app.post('/api/ai/test', auth, adminOnly, wrap(async (req, res) => {
   const c = await aiCfg();
   if (!c.key) return res.status(400).json({ error: 'Paste your Gemini key first' });
   try {
-    const j = await gemini(c, { contents: [{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], generationConfig: { maxOutputTokens: 20 } });
+    const j = await gemini(c, { contents: [{ role: 'user', parts: [{ text: 'Reply with just: OK' }] }], generationConfig: { maxOutputTokens: 512 } });
     const ok = ((((j.candidates || [])[0] || {}).content || {}).parts || []).some((p) => p.text);
     if (!ok) throw new Error('Gemini answered, but with nothing. Try another model.');
   } catch (e) { return res.status(400).json({ error: e.message }); }
-  res.json({ ok: true });
+  res.json({ ok: true, model: (await aiCfg()).model });
 }));
 
 // ---- Push notification routes ----
