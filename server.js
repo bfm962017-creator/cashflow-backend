@@ -1454,9 +1454,10 @@ app.post('/api/ai/chat', auth, wrap(async (req, res) => {
 app.get('/api/ai', auth, adminOnly, wrap(async (req, res) => res.json(aiView(await aiCfg()))));
 app.put('/api/ai', auth, adminOnly, wrap(async (req, res) => {
   const c = await aiCfg(), b = req.body || {};
-  const key = b.key == null ? null : String(b.key).trim().slice(0, 200), model = AI_MODELS.includes(b.model) ? b.model : c.model, limit = Math.round(Number(b.limit));
+  // Pasted keys often carry spaces, line breaks or quotes from the copy; Google's own check (Test) decides if it works.
+  const key = b.key == null ? null : String(b.key).replace(/\s+/g, '').replace(/^["'`]+|["'`]+$/g, '').slice(0, 300), model = AI_MODELS.includes(b.model) ? b.model : c.model, limit = Math.round(Number(b.limit));
   if (!(limit >= 5 && limit <= 500)) return res.status(400).json({ error: 'Daily limit must be between 5 and 500' });
-  if (key != null && key && !/^[\w-]{20,200}$/.test(key)) return res.status(400).json({ error: 'That does not look like a Gemini API key' });
+  if (key != null && key && !/^[\x21-\x7e]{20,300}$/.test(key)) return res.status(400).json({ error: 'That key looks incomplete. Copy the whole key from Google AI Studio (it is usually about 39 characters) and paste it again.' });
   // Once a key is saved, replacing or removing it needs the admin's password.
   if (key != null && c.key && !c.fromEnv) {
     const k = 'pw|' + req.user.username;
