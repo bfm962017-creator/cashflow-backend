@@ -1405,9 +1405,10 @@ Rules:
 - Only answer about this cash book and simple business advice from its numbers. Politely decline anything else.
 - Reply in ${AI_LANG[lang] || 'the same language as the question'}.${admin ? '' : '\n- If they ask about other users or the whole business, explain only the admin can see that.'}`;
 }
-// Short thinking: answers come from tool numbers, and a long think can run past the server's time limit.
+// Short thinking on Gemini 2.5. Gemini 3 is left on its own defaults: in production, calls to
+// gemini-3.8-flash with a thinkingLevel (or a low temperature) never answered, while plain calls did.
 function thinkCfg(model) {
-  if (/gemini-[3-9]/.test(model)) return { thinkingLevel: 'low' };
+  if (/gemini-[3-9]/.test(model)) return null;
   if (/gemini-2\.5/.test(model)) return { thinkingBudget: /pro/.test(model) ? 128 : 0 };
   return null;
 }
@@ -1420,6 +1421,7 @@ async function gemini(c, body, retried) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), Math.min(45000, left));
   try {
     const { noThink, ...send } = body, t0 = Date.now();
+    console.log('gemini call', c.model, JSON.stringify(send.generationConfig || {}), 'tools:' + !!send.tools, 'turns:' + (send.contents || []).length);
     const r = await fetch(GEMINI_URL + encodeURIComponent(c.model) + ':generateContent', { method: 'POST', signal: ctl.signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': c.key }, body: JSON.stringify(send) });
     const j = await r.json().catch(() => ({}));
